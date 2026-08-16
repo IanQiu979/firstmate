@@ -265,6 +265,7 @@ This section is the single owner of the canonical schema and its per-field seman
       "use": [
         { "harness": "<adapter>", "model": "<optional model>", "effort": "<low|medium|high|xhigh|max, optional>" }
       ],
+      "select": "quota-balanced",
       "why": "<optional rationale that helps firstmate choose>"
     }
   ],
@@ -280,6 +281,9 @@ The single-object form stays fully backward-compatible, and every profile needs 
 Profile `model` and `effort` fields and rule `why` are optional.
 An omitted model or effort means the selected harness uses its own default for that axis.
 Every profile array is an implicit quota-aware choice resolved through `quota-array-dispatch`.
+A rule may also set the optional `select` field to name that resolution procedure explicitly; `quota-balanced` is the only accepted value today and is already the implicit default for every profile array, so setting it changes nothing beyond making the intent visible in the file and in the rule's `BOOTSTRAP_INFO:` fact.
+`select` is a per-rule field only: the top-level `default` array always resolves through the same implicit `quota-balanced` procedure and accepts no selector of its own.
+An empty or non-string `select` is reported as `select must be a non-empty string`, and any other string as `unknown select: <value>`, both through the `CREW_DISPATCH: invalid` diagnostic below.
 If no dispatch rule fits, firstmate resolves `default` through the same object-or-array path before falling back to `config/crew-harness`.
 If a selected profile carries an effort value the chosen harness does not accept, `fm-spawn.sh` records the requested `effort=` in task meta for traceability but omits the launch flag, and bootstrap reports the invalid harness/effort pair as a `CREW_DISPATCH` diagnostic when it is visible in the file.
 See [`docs/examples/crew-dispatch.json`](examples/crew-dispatch.json) for a starting point to copy into local `config/crew-dispatch.json`.

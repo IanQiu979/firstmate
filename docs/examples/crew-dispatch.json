@@ -16,7 +16,8 @@
         { "harness": "claude", "model": "claude-sonnet-5", "effort": "high" },
         { "harness": "codex", "model": "gpt-5.5", "effort": "high" }
       ],
-      "why": "Use a strong coding profile for big, ambiguous work; resolve the alternatives through quota-array-dispatch."
+      "select": "quota-balanced",
+      "why": "Use a strong coding profile for big, ambiguous work; resolve the alternatives through quota-array-dispatch. The optional select field names that resolution explicitly and is the implicit default for every array."
     }
   ],
   "default": [
