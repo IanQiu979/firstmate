@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Structural regression tests for the tracked documentation audience inventory.
+# Structural regression tests for the tracked documentation audience inventory
+# and for docs/scripts.md's coverage of the shipped bin/ surface.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -135,7 +136,37 @@ MD
   pass "local links resolve while dates, versions, commands, and incident prose remain semantically reviewed"
 }
 
+# docs/scripts.md is the only index of bin/, and fm-doc-audience-check.sh
+# validates prose inventory rather than bin/ coverage, so nothing else catches a
+# new script that never gets a row. Both directions are asserted: an unlisted
+# script makes the toolbelt silently incomplete, and a row naming a file that no
+# longer ships sends a reader to a script that is not there.
+test_scripts_page_covers_every_shipped_bin_script() {
+  local page missing dangling name
+  page="$ROOT/docs/scripts.md"
+  assert_present "$page" "docs/scripts.md is missing"
+
+  missing=""
+  for path in "$ROOT"/bin/*.sh "$ROOT"/bin/*.mjs "$ROOT"/bin/backends/*; do
+    [ -f "$path" ] || continue
+    name=${path#"$ROOT"/bin/}
+    grep -qF "\`$name\`" "$page" || missing="$missing $name"
+  done
+  [ -z "$missing" ] || fail "docs/scripts.md has no row for:$missing"
+
+  dangling=""
+  # shellcheck disable=SC2016 # The pattern matches literal backticks, not an expansion.
+  while IFS= read -r name; do
+    [ -f "$ROOT/bin/$name" ] || dangling="$dangling $name"
+  done < <(grep -o '`\(fm-[a-z0-9-]*\.\(sh\|mjs\)\|backends/[a-z0-9-]*\.\(sh\|py\)\)`' "$page" |
+    tr -d '`' | sort -u)
+  [ -z "$dangling" ] || fail "docs/scripts.md names scripts that do not ship:$dangling"
+
+  pass "docs/scripts.md covers every shipped bin/ script and names no missing one"
+}
+
 test_repository_inventory_passes
 test_duplicate_and_setup_classification_fail
 test_required_pointer_fails
 test_local_links_and_no_keyword_heuristic
+test_scripts_page_covers_every_shipped_bin_script
