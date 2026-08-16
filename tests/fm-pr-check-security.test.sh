@@ -2616,6 +2616,52 @@ SH
   pass "returned custom check descendants are drained on installed and fallback timeout paths"
 }
 
+# AGENTS.md tells firstmate to run fm-check-register.sh as the last step before
+# the watcher may execute a custom check, so probing it for syntax must not read
+# as "custom checks are unavailable in this home". Any leading-dash argument is
+# misuse (exit 2 plus usage), never a missing-check capability error (exit 1).
+test_check_register_help_is_usage_not_a_capability_error() {
+  local dir out rc flag
+  dir=$(make_case check-register-usage)
+
+  for flag in --help -h; do
+    set +e
+    out=$(FM_HOME="$dir/home" "$REGISTER" "$flag" 2>&1)
+    rc=$?
+    set -e
+    expect_code 0 "$rc" "$flag did not exit 0"
+    assert_contains "$out" "Usage: fm-check-register.sh <task-id>" \
+      "$flag did not print the usage line"
+    assert_contains "$out" "check-trust" \
+      "$flag did not explain what registration binds"
+    case "$out" in
+      *"custom check is unavailable"*)
+        fail "$flag reported a capability error instead of usage"
+        ;;
+    esac
+  done
+
+  set +e
+  out=$(FM_HOME="$dir/home" "$REGISTER" --bogus 2>&1)
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "an unknown option was not rejected as misuse"
+  assert_contains "$out" "Usage: fm-check-register.sh <task-id>" \
+    "an unknown option did not print usage"
+
+  # A real absent check must keep reporting the capability error on exit 1, so
+  # the dash guard cannot swallow the diagnostic it was added beside.
+  set +e
+  out=$(FM_HOME="$dir/home" "$REGISTER" task-a 2>&1)
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "a missing custom check no longer exits 1"
+  assert_contains "$out" "custom check is unavailable" \
+    "a missing custom check no longer reports the capability error"
+
+  pass "fm-check-register.sh: --help prints usage while a missing check still reports unavailability"
+}
+
 test_teardown_removes_poll_artifacts() {
   local dir fakebin kind artifact counterpart rc
   dir=$(make_case teardown-cleanup)
@@ -3391,4 +3437,5 @@ test_bootstrap_migrates_before_other_mutations
 test_bootstrap_isolates_incomplete_poll_migration
 test_custom_snapshot_cleanup_on_signal
 test_returned_custom_check_descendants_are_drained
+test_check_register_help_is_usage_not_a_capability_error
 test_teardown_removes_poll_artifacts

@@ -1,7 +1,31 @@
 #!/usr/bin/env bash
 # Bind an intentional custom watcher check to its current bytes.
-# Usage: fm-check-register.sh <id>
+# Usage: fm-check-register.sh <task-id>
+#        fm-check-register.sh --help
+#
+# The watcher executes state/<task-id>.check.sh only from a snapshot whose
+# SHA-256 matches the hash recorded in state/<task-id>.check-trust, and rejects
+# the check outright when it does not. Registration is therefore the last step
+# after hand-writing or editing a custom check, and must be repeated after every
+# edit, because the recorded hash binds the exact bytes present at registration.
+#
+# The check must be an ordinary regular file, mode 0700, single-link, on the
+# state directory's own device. Anything else is refused rather than registered.
+#
+# Exit codes: 0 registered; 1 the check, the state directory, or the trust path
+# is unusable; 2 invalid use.
 set -u
+
+usage() {
+  sed -n '2,16{s/^# \{0,1\}//;p;}' "$0"
+}
+
+# A leading dash is an option, never a task id. Reporting it as misuse keeps a
+# probe for the syntax from surfacing as a missing-check capability error.
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  -*) usage >&2; exit 2 ;;
+esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
