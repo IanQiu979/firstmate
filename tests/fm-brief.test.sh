@@ -671,6 +671,40 @@ test_pause_verb_override_renders_all_brief_scaffolds() {
   pass "fm-brief.sh: custom pause verb renders in every scaffold"
 }
 
+# Every scaffold must teach the `note:` verb. bin/fm-classify-lib.sh's
+# status_line_is_unread_surface consumes it and the drain's UNREAD STATUS
+# section is its only guaranteed presentation, so a worker that never learns it
+# reports a substantive answer as `working:` instead - which the classifier
+# absorbs as routine progress, exactly the burial that surface exists to stop.
+test_note_verb_is_taught_in_all_brief_scaffolds() {
+  local home kind id brief
+  home="$TMP_ROOT/note-verb-home"
+  mkdir -p "$home/data"
+
+  for kind in ship scout secondmate; do
+    id="brief-note-verb-$kind"
+    case "$kind" in
+      ship)
+        FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate --mode no-mistakes >/dev/null 2>&1
+        ;;
+      scout)
+        FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate --scout >/dev/null 2>&1
+        ;;
+      secondmate)
+        FM_HOME="$home" FM_SECONDMATE_CHARTER='note verb domain' \
+          "$ROOT/bin/fm-brief.sh" "$id" --secondmate --no-projects >/dev/null 2>&1
+        ;;
+    esac
+    brief="$home/data/$id/brief.md"
+    # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+    assert_grep 'Use `note: {answer}`' "$brief" \
+      "$kind brief did not teach the note: status verb"
+    assert_grep 'never absorbed as routine progress' "$brief" \
+      "$kind brief did not explain why note: outranks working: for an answer"
+  done
+  pass "fm-brief.sh: every scaffold teaches the note: status verb"
+}
+
 test_scout_and_secondmate_load_decision_hold_policy() {
   local home scout charter
   home="$TMP_ROOT/decision-policy-home"
@@ -728,5 +762,6 @@ test_secondmate_no_projects_charter
 test_secondmate_marked_request_reporting_contract
 test_secondmate_directory_paths_are_absolute_and_output_is_stable
 test_pause_verb_override_renders_all_brief_scaffolds
+test_note_verb_is_taught_in_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
 test_scout_and_secondmate_scaffold
