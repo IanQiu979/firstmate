@@ -532,6 +532,7 @@ FM_ZELLIJ_SESSION=firstmate  # zellij-only: named session for normal backend ops
 CMUX_SOCKET_PASSWORD=   # cmux-only: socket password fallback when config/cmux-socket-password is absent (docs/cmux-backend.md)
 FM_SESSION_START_STATUS_TAIL=5   # state/*.status lines printed per task in the session-start digest; each line is capped by bin/fm-line-cap-lib.sh
 FM_SESSION_START_QUEUED_LIMIT=20   # plain queued backlog rows in the session-start digest; in-flight, held, and blocked rows are never bounded and done rows are never listed
+FM_SESSION_START_TIMEOUT=120   # whole-digest budget in seconds; the deferred network stage exists so a slow network cannot spend it and truncate the digest (docs/sessionstart-nudge.md "Runtime bound")
 FM_BOOTSTRAP_DETECT_ONLY=0   # internal/read-only session-start mode: skip bootstrap's mutating sweeps and print advisory TANGLE wording
 FM_BOOTSTRAP_NETWORK=all   # internal session-start phase split: all, skip (local steps only), or only (network steps only); see bin/fm-bootstrap.sh
 FM_STARTUP_NETWORK_TIMEOUT=120   # seconds bounding the whole deferred network stage; hitting it prints an actionable NETWORK_CHECKS line
@@ -627,6 +628,10 @@ FM_CRASH_BACKOFF=60                # seconds to wait after crossing the crash th
 FM_CRASH_NORMAL_SLEEP=5            # seconds to wait after an isolated watcher crash
 FM_LOG_MAX_BYTES=1048576           # daemon log size that triggers trimming
 FM_LOG_KEEP_LINES=2000             # daemon log lines kept when trimming
+FM_BEARINGS_LANDED=6               # overall cap on recently landed rows in the /bearings digest
+FM_BEARINGS_LANDED_PER_HOME=       # per-home cap on those landed rows; unset uses FM_BEARINGS_LANDED
+FM_BEARINGS_PR_LIMIT=20            # per-repository open-PR results in the /bearings digest; only read with --include-prs
+FM_LINT_JOBS=2                     # parallel fm-lint.sh shard workers; 1 runs the same shards serially
 ```
 
 `fm-teardown.sh` retries only Git's `Unable to create '...index.lock': File exists` return failure up to `FM_TREEHOUSE_RETURN_LOCK_RETRIES` times.
