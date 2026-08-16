@@ -53,6 +53,9 @@ Each secondmate has a persistent isolated `FM_HOME`, including its own state, ba
 
 Tracked files hold shared instructions and tooling; `data/` holds durable private fleet records; `state/` holds runtime records and append-only status events; `config/` holds local operating choices; and `projects/` contains clones that are read-only to firstmate except under hard rule 1's concrete captain-approved project operation exception.
 
+The map below is a navigational excerpt, not an inventory: `docs/configuration.md` and each producing script's header stay the owners, and `state/` in particular holds durable records this map does not list.
+So never read an absent entry as proof that a `state/` file is foreign or safe to remove; find its producing script first.
+
 ```
 AGENTS.md            this file (CLAUDE.md is a symlink to it)
 CONTRIBUTING.md      contributor workflow and repo conventions
