@@ -36,7 +36,10 @@ document:
 commands:
   lint: 'bin/fm-lint.sh'
 
-# Store test evidence in this repo so it is committed alongside the change instead of kept in a temp dir.
+# Store test evidence in the working tree instead of a temp dir so no-mistakes can publish it.
+# Artifacts land under the gitignored .no-mistakes/evidence/<branch>/ and are pushed as commits on
+# the orphan no-mistakes/evidence branch, which PR bodies link into by commit sha. Nothing under
+# .no-mistakes/ is ever committed to a code branch; CI's tracked-path invariant enforces that.
 test:
   evidence:
     store_in_repo: true
