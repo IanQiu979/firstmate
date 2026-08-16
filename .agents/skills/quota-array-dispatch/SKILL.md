@@ -33,7 +33,9 @@ For each candidate, preserve explicit `harness`, `model`, and `provider`; `harne
 
 Stale raw windows are diagnostic, never headroom or fabricated runway.
 Grok's `credits.remaining` is a prepaid balance unrelated to `percentRemaining`; never read it as exhaustion.
-Read all windows named by `boundedBy`, `limitingWindowIds`, `aheadWindowIds`, `behindWindowIds`, `onPaceWindowIds`, `unknownWindowIds`, and `unmeasurableWindowIds`.
+Read all windows named by `boundedBy`, `limitingWindowIds`, `aheadWindowIds`, `behindWindowIds`, `onPaceWindowIds`, `unknownWindowIds`, `unmeasurableWindowIds`, and `unresolvedWindowIds`.
+Window ids are vendor-shaped and vary by provider - a `schemaVersion: 3` snapshot reports `five_hour`, `seven_day`, and `model:fable` for claude against `weekly` for codex - so read the ids the snapshot actually carries and never assume a shared vocabulary across providers.
+Each row also carries `relationshipStatus`; treat `unknown` there as the snapshot declining to resolve that scope, which is disclosed uncertainty rather than an ineligible candidate.
 The compact default output intentionally omits numeric reserve, while `--json` and `--full` retain reserve diagnostics.
 
 ## Establish the provider relation before reading quota
@@ -48,6 +50,7 @@ Name the evidence for each relation you assert so the conclusion is inspectable.
    A provider-level or `all_models`/`all_products` scope bounds every model you established in that family, including one with no window of its own.
    A named-model or named-product scope is an additional bound for that model alone and is irrelevant to every other model in the family.
    Read `quotaSemantics.description`, which states the vendor's own bounding rule.
+   That row's `relationshipStatus` corroborates the relation you established by hand: `known` agrees with it, and `unknown` means the snapshot resolved no relation for that scope, so cite your own catalog evidence rather than treating either value as the finding.
 3. Record what remains unknown instead of converting it into a verdict.
 
 ## Authentication is scoped to the selected surface
