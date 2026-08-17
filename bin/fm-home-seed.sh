@@ -30,6 +30,9 @@
 #       Refuse records that operational consumers cannot parse, unavailable or
 #       unsafe registry files when present, non-absolute or unresolvable homes,
 #       duplicate ids or homes, and nested or overlapping homes.
+#       Every unparseable record in the file is reported, one "error:" line
+#       each, so a single bad entry never hides the rest; the remaining route
+#       and binding checks run only on a registry that parses end to end.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
