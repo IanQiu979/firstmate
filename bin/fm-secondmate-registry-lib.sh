@@ -8,7 +8,9 @@
 #   (host: ...; root: ...; home: ...; scope: ...; projects: ...; added YYYY-MM-DD)
 # Summary text and scope text are natural language and may contain parentheses
 # and semicolons, so field boundaries are anchored to the suffix markers rather
-# than to the first incidental punctuation.
+# than to the first incidental punctuation. The suffix is therefore anchored to
+# end-of-line and must be the last thing on the record; extra prose belongs in
+# the summary, ahead of it.
 
 SECONDMATE_REGISTRY_ID=
 SECONDMATE_REGISTRY_SUMMARY=
@@ -89,6 +91,34 @@ secondmate_registry_line_for_id() {
   secondmate_registry_parse_line "$SECONDMATE_REGISTRY_LINE"
 }
 
+# Print every REGISTERED secondmate in file order, one TAB-separated
+# "<status><TAB><id>" record per "- " line:
+#   ok<TAB><id>         a record whose route fields parse
+#   malformed<TAB><id>  a record whose leading id token is readable but whose
+#                       route fields are not
+#   malformed<TAB>-     a record whose leading id token is unreadable
+# This answers registration, not liveness: a caller that must account for every
+# registered secondmate reads this, and a caller that needs the route fields
+# still goes through secondmate_registry_line_for_id. Parsing clobbers the
+# SECONDMATE_REGISTRY_* globals, so read them before calling this or call it in
+# a subshell.
+secondmate_registry_ids() {
+  local reg=$1 line id
+  [ -f "$reg" ] && [ ! -L "$reg" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in "- "*) ;; *) continue ;; esac
+    if secondmate_registry_parse_line "$line"; then
+      printf 'ok\t%s\n' "$SECONDMATE_REGISTRY_ID"
+      continue
+    fi
+    id=-
+    if [[ "$line" =~ ^-[[:space:]]([A-Za-z0-9._-]+)([[:space:]]|$) ]]; then
+      id=${BASH_REMATCH[1]}
+    fi
+    printf 'malformed\t%s\n' "$id"
+  done < "$reg"
+}
+
 secondmate_registry_field() {
   local reg=$1 id=$2 key=$3
   secondmate_registry_line_for_id "$reg" "$id" || return 1
@@ -117,7 +147,7 @@ secondmate_registry_path_key() {
 
 secondmate_registry_validate_bindings() {
   local reg=$1 resolver=$2 expected_id=${3:-} expected_home=${4:-}
-  local tmp snapshot bindings line id host root home home_key duplicate_homes duplicate_ids overlaps expected_home_key
+  local tmp snapshot bindings line id host root home home_key duplicate_homes duplicate_ids overlaps expected_home_key malformed
   SECONDMATE_REGISTRY_MATCH_HOST=
   SECONDMATE_REGISTRY_MATCH_ROOT=
   SECONDMATE_REGISTRY_MATCH_HOME=
@@ -141,10 +171,30 @@ secondmate_registry_validate_bindings() {
     SECONDMATE_REGISTRY_ERROR="secondmate registry is unavailable or unsafe: $reg"
     return 1
   fi
+  # Parse pass. Aborting on the first malformed record would let one bad entry
+  # hide every other record in the file from validation, so all of them are
+  # collected and reported together. The binding pass below then runs only on a
+  # registry that is known to parse end to end.
+  malformed=""
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       "- "*)
         if ! secondmate_registry_parse_line "$line"; then
+          malformed="${malformed}${malformed:+$'\n'}malformed secondmate registry entry: $line"
+        fi
+        ;;
+    esac
+  done < "$snapshot"
+  if [ -n "$malformed" ]; then
+    rm -rf -- "$tmp"
+    SECONDMATE_REGISTRY_ERROR=$malformed
+    return 1
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "- "*)
+        if ! secondmate_registry_parse_line "$line"; then
+          # Unreachable: the parse pass above already proved every record parses.
           rm -rf -- "$tmp"
           SECONDMATE_REGISTRY_ERROR="malformed secondmate registry entry: $line"
           return 1

@@ -194,9 +194,16 @@ registry_id_conflict_for_assignment() {
 }
 
 validate_registry() {
+  local reason
   [ -e "$REG" ] || [ -L "$REG" ] || return 0
   secondmate_registry_validate_bindings "$REG" resolved_path || {
-    printf 'error: %s\n' "$SECONDMATE_REGISTRY_ERROR" >&2
+    # The parser reports every malformed record at once, so the reason may be
+    # several lines; prefix each one rather than only the first.
+    while IFS= read -r reason; do
+      printf 'error: %s\n' "$reason" >&2
+    done <<EOF
+$SECONDMATE_REGISTRY_ERROR
+EOF
     return 1
   }
 }
