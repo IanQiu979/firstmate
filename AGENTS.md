@@ -97,7 +97,7 @@ When that section reports its checks still in progress it names exactly what is 
 The digest runs these steps in order, and its header owns their exact composition:
 
 1. **Lock** - the per-home session lock, acquired before anything mutates shared state, which then starts the deferred network stage above.
-2. **Bootstrap** - detect-only checks (tool and version problems, the worktree-tangle check, harness override, dispatch-profile validation, backlog-backend status) that keep routine confirmations silent by default, with read-only advisory tangle wording and no checkout repair command when the lock was refused.
+2. **Bootstrap** - detect-only checks (tool and version problems, the worktree-tangle check, harness override, dispatch-profile validation, backlog-backend status) that always run and keep routine confirmations silent by default, with read-only advisory tangle wording and no checkout repair command when the lock was refused.
    Home-local stale Herdr projection cleanup and the six mutating sweeps - non-executing legacy PR-check migration, fleet sync, secondmate convergence, secondmate liveness, pending remote handoff retry, and Relay artifact writes - run only when this session actually holds the lock, and the four network ones among them run in the deferred stage rather than here.
    The secondmate liveness sweep accounts for every registered secondmate: it relaunches only from the recovery-grade `dead` or `missing` states, preserves ambiguous, unreadable, or unreachable remote targets, and reports skipped or failed guarantees as `SECONDMATE_LIVENESS:` lines.
 3. **Wake queue** - when locked, the durable wake queue presented as this turn's first work queue, with its raw records prominent; a clearly labeled status-event annotation may follow a valid `signal` record and carries every status line still unread at the presentation cursor, but never replaces the raw record or current-state reconciliation, and a lapsed watcher chain still surfaces here through the same guard alarm.
@@ -292,7 +292,8 @@ The promoted worker must inventory scratch state, return to a clean default-bran
 
 Fleet supervision is an always-loaded operational contract; `docs/architecture.md`, `docs/turnend-guard.md`, the emitted session-start block, and script help own mechanisms and harness-specific recipes.
 
-Whenever work is under way, keep exactly one live supervision cycle using the emitted protocol for this primary harness; Relay and any registered process-to-event source require that same live cycle even with no fleet work.
+Whenever work is under way, keep exactly one live supervision cycle using the emitted protocol for this primary harness.
+Relay may require that same live cycle with no fleet work, and a registered process-to-event source keeps it required even with no fleet work.
 Do not substitute another harness's wait shape, use shell `&`, or create a second cycle when a healthy one already exists.
 For every actionable wake, follow the ordinary-wake continuation in the emitted protocol; use its repair action only when the live cycle is missing or failed.
 No turn ends blind while work is under way, including turns described as holding or waiting.
@@ -345,9 +346,21 @@ Load `stuck-crewmate-recovery` after a stale wake, looping or confused pane, ans
 **Talk in outcomes, not mechanics.**
 Every captain-facing message must translate internal state into the project outcome, consequence, and next decision.
 Use the captain's nouns: the investigation, the scout, the fix, the PR, the review, the decision, the blocker, the credential, the local copy, the worker, or the project.
-Do not expose internal terms such as startup machinery, locks, watchers, polling, crewmates, task ids, briefs, worktrees, checkouts, status or metadata files, teardown, promotion, harness/backend/runtime/adapter names, context budgets, delivery-mode names, autonomy flags, wake types, status prefixes, decision holds, pipeline-step or validation-state labels, or compressed safety labels such as fail-closed, fail-open, and their variants.
+Do not expose internal terms such as startup machinery, locks, watchers, polling, crewmates, task ids, briefs, worktrees, checkouts, status or metadata files, teardown, promotion, harness names, runtime backend names, context budgets, delivery-mode names, autonomy flags, wake types, status prefixes, decision holds, pipeline step names, validation-state labels, or compressed safety labels such as fail-closed, fails closed, fail-open, fails open, fail loudly, or close variants.
 Scout and second mate are accepted Firstmate nautical house vocabulary and do not need translation when they naturally name that work or role.
-When evidence uses an internal label, rewrite it before sending: worktree, checkout, primary checkout, and local-main become the local copy, isolated copy, or local branch (only if the location matters); teardown becomes cleanup; wake, watcher, heartbeat, stale, signal, and check become notification, monitoring, waiting too long, or stopped responding; hold, gate, ask-user, needs-decision, blocked, and paused become the concrete decision, wait, approval, blocker, or external delay; done, failed, fix-review, checks-passed, cancelled, validation step, and pipeline state become the concrete result, review finding, passing checks, failed check, or stopped validation; brief becomes instructions; crewmate becomes worker (only when naming the helper matters); harness, backend, runtime, and adapter become the worker runtime or tool (only when the tool choice itself blocks work); status file, metadata, state, task id, and raw path become a durable or local record, omitted unless the captain needs the path to act; fail-closed, fails closed, fail loudly, and refuses loudly become stops safely when something goes wrong, refuses rather than proceeding, or reports the concrete missing requirement; and fail-open, fails open, passive fail-open, and degraded-open become steps aside and lets work continue when the check cannot complete, or continues without that optional protection.
+When evidence uses an internal label, rewrite it before sending:
+
+- worktree, checkout, primary checkout, or local-main -> local copy, isolated copy, or local branch, only if the location matters.
+- teardown -> cleanup.
+- wake, watcher, heartbeat, stale, signal, or check -> notification, monitoring, waiting too long, or stopped responding.
+- hold, gate, ask-user, needs-decision, blocked, or paused -> the concrete decision, wait, approval, blocker, or external delay.
+- done, failed, fix-review, checks-passed, cancelled, validation step, or pipeline state -> the concrete result, review finding, passing checks, failed check, or stopped validation.
+- brief -> instructions.
+- crewmate -> worker, only when naming the helper matters.
+- harness, backend, runtime, or adapter -> worker runtime or tool, only when the tool choice itself blocks work.
+- status file, metadata, state, task id, or raw path -> durable record, local record, or omit it unless the captain needs the file path to act.
+- fail-closed, fails closed, fail loudly, or refuses loudly -> stops safely when something goes wrong, refuses rather than proceeding, or reports the concrete missing requirement.
+- fail-open, fails open, passive fail-open, or degraded-open -> steps aside and lets work continue when the check cannot complete, or continues without that optional protection.
 
 Never relay worker reports, status lines, tool output, validation-state labels, or decision records verbatim into captain chat; read them as evidence, then send the plain-English outcome and consequence.
 Private evidence reports may retain exact identifiers, paths, status lines, validation labels, and internal terms when they are useful, but the captain-facing chat summary that points to the report still follows this translation rule.
