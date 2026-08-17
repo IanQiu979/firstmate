@@ -615,15 +615,23 @@ secondmate_liveness_sweep() {
 # crash, a partial teardown, a home restored from backup - would otherwise go
 # silently un-relaunched and unreported. Relaunch needs a recorded endpoint to
 # act on, so this pass names the gap instead of guessing at one; recovery for a
-# named entry stays with secondmate-provisioning. An unparseable record is
-# reported too, because a registry the parser cannot read is a registered
-# secondmate this sweep cannot account for either.
+# named entry stays with secondmate-provisioning. An unparseable record, and a
+# registry that is present but cannot be read at all, are reported too, because
+# a registration the parser cannot read is a registered secondmate this sweep
+# cannot account for either. Every line keeps the one documented shape
+# `secondmate <id>: skipped: <reason>`; where no real id is readable the
+# literal `<unknown>` stands in for it, which no registry id can collide with
+# because a registry id is a plain [A-Za-z0-9._-]+ slug.
 secondmate_liveness_registry_only() {  # <space-delimited-swept-ids>
   local swept=$1 status id
   while IFS=$'\t' read -r status id; do
+    if [ "$status" = unusable ]; then
+      echo "SECONDMATE_LIVENESS: secondmate <unknown>: skipped: unreadable or unsafe registry $DATA/secondmates.md; run bin/fm-home-seed.sh validate"
+      continue
+    fi
     if [ "$status" = malformed ]; then
       if [ "$id" = - ]; then
-        echo "SECONDMATE_LIVENESS: skipped: unparseable registry record with no readable id; run bin/fm-home-seed.sh validate"
+        echo "SECONDMATE_LIVENESS: secondmate <unknown>: skipped: unparseable registry record with no readable id; run bin/fm-home-seed.sh validate"
       else
         echo "SECONDMATE_LIVENESS: secondmate $id: skipped: unparseable registry record; run bin/fm-home-seed.sh validate"
       fi

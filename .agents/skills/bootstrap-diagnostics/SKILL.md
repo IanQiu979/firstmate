@@ -55,6 +55,8 @@ When any diagnostic needs captain attention, report the plain consequence and re
   Investigate the reason because that secondmate is not guaranteed live.
   The `no runtime record` reason means the secondmate is registered but has no recorded endpoint for the sweep to probe or relaunch, so load `secondmate-provisioning` and reconcile that one secondmate rather than treating it as retired.
   An `unparseable registry record` reason means the routing contract itself cannot be read for that entry; repair the record so the generated suffix ends the line, then confirm with `bin/fm-home-seed.sh validate`.
+  An `unreadable or unsafe registry` reason means the whole registry file could not be opened, so NO registered secondmate was accounted for; check that `data/secondmates.md` is a readable regular file and not a symlink before trusting any other secondmate diagnostic from that session.
+  Both of those reasons, and any other case where no real id is readable, report the secondmate as the literal `<unknown>` so every line still parses by the one rule above.
 - `SECONDMATE_HANDOFF: secondmate <id>: pending delivery: <n> item(s)` - queued work has already left the main dispatchable backlog and remains safe in the named remote route's backlog-format outbox.
   Preserve that outbox and rerun `bin/fm-backlog-handoff.sh --resume-pending` after same-host connectivity returns; never re-add or dispatch the items from the main backlog.
   An unsafe-outbox variant requires path and file-type inspection before any retry.
