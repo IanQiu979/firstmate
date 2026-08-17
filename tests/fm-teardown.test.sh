@@ -5,9 +5,10 @@
 # treehouse return hard-resets the worktree. "Landed" means reachable from a remote
 # OR - for a normal ship task whose commits are not so reachable - its PR is merged
 # and GitHub reports a PR head that contains the current local work, or its content
-# is already in the up-to-date default branch.
+# is already in the up-to-date default branch, or every commit it holds is already
+# present there as a patch.
 #
-# Covers three fixes:
+# Covers four fixes:
 #   - local-only fork-remote: a fork IS a remote, so fork-pushed upstream-
 #     contribution PRs are teardown-eligible (the pre-fix code false-refused them).
 #   - squash-merge-then-delete-branch: the branch's own commits live nowhere on a
@@ -15,6 +16,12 @@
 #     main. Reachability alone false-refused this common GitHub flow; the check now
 #     recognizes a merged PR head containing the local work (or the content already
 #     in main) as landed.
+#   - rebase-rewrites-commits: a rebase gives every commit a new object id, so a
+#     branch whose content landed under rewritten commits can never satisfy a
+#     reachability test. Because bin/fm-merge-local.sh is fast-forward-only, rebasing
+#     onto a moved default branch is the normal way local-only chains land, which
+#     made this a permanent false refusal. The check now also accepts a branch whose
+#     every commit is present in the default branch as a patch.
 #   - teardown-lock-race: a killed crew process can leave a transient worktree
 #     git index.lock that blocks teardown. The return path retries on the lock
 #     error signature (even if the lock self-clears mid-check), then only removes a
@@ -38,6 +45,10 @@
 #   (o) fm-pr-check rerun after HEAD moved                      -> no stale pr_head
 #   (p) fm-pr-check when local HEAD lags                        -> record remote PR head
 #   (q) no-mistakes + NO pr= recorded, PR discovered by branch  -> ALLOW  (yolo/no-CI merge)
+#   (q1) local-only + patch landed under a rewritten commit     -> ALLOW  (rebase fix)
+#   (q2) local-only + one commit's patch absent from main       -> REFUSE (safety)
+#   (q3) local-only + every patch landed but worktree dirty     -> REFUSE (dirty wins)
+#   (q4) no-mistakes + patch landed, main edited it afterwards  -> ALLOW  (rebase fix)
 #
 # Also covers backlog teardown-lock-race: a git index.lock left in the worktree by a
 # killed crew process (bin/fm-teardown.sh's teardown_treehouse_return).
@@ -251,6 +262,44 @@ land_on_origin_main() {
   printf '%s\n' "$content" > "$tmp/$file"
   git -C "$tmp" add -- "$file"
   git -C "$tmp" -c user.email=t@t -c user.name=t commit -q -m "squash $file"
+  git -C "$tmp" push -q origin HEAD:main
+  rm -rf "$tmp"
+}
+
+# Move the project's LOCAL default branch on with an unrelated commit, then apply
+# <file>=<content> there as a fresh commit. The resulting commit carries the same
+# patch as the task branch's own commit but a different object id, which is what a
+# rebase-then-fast-forward leaves behind: the branch's commits are unreachable from
+# main while their content is fully landed. Args: case_dir file content
+land_rewritten_patch_on_local_main() {
+  local case_dir=$1 file=$2 content=$3
+  printf '%s\n' "main moved on" > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t \
+    commit -q -m "unrelated main commit"
+  printf '%s\n' "$content" > "$case_dir/project/$file"
+  git -C "$case_dir/project" add -- "$file"
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t \
+    commit -q -m "rebased: add $file"
+}
+
+# Same rewritten-commit landing, but on origin's default branch, followed by a
+# later edit of the same file. The later edit is what makes the whole-tree content
+# check inconclusive, so only patch equivalence can prove the work landed.
+# Args: case_dir file content later_content
+land_rewritten_patch_then_edit_on_origin_main() {
+  local case_dir=$1 file=$2 content=$3 later=$4 tmp
+  tmp="$case_dir/_rebased"
+  git clone -q "$case_dir/origin.git" "$tmp"
+  printf '%s\n' "main moved on" > "$tmp/unrelated.txt"
+  git -C "$tmp" add -- unrelated.txt
+  git -C "$tmp" -c user.email=t@t -c user.name=t commit -q -m "unrelated main commit"
+  printf '%s\n' "$content" > "$tmp/$file"
+  git -C "$tmp" add -- "$file"
+  git -C "$tmp" -c user.email=t@t -c user.name=t commit -q -m "rebased: add $file"
+  printf '%s\n' "$later" > "$tmp/$file"
+  git -C "$tmp" add -- "$file"
+  git -C "$tmp" -c user.email=t@t -c user.name=t commit -q -m "follow-up edit of $file"
   git -C "$tmp" push -q origin HEAD:main
   rm -rf "$tmp"
 }
@@ -651,6 +700,91 @@ test_local_only_merged_to_local_main_allows() {
   expect_code 0 "$rc" "merged-main: teardown should succeed when work is merged into local main"
   ! grep -q REFUSED "$case_dir/stderr" || fail "merged-main: teardown printed a REFUSED line"
   pass "local-only worktree with work merged into local main is torn down (no regression)"
+}
+
+test_local_only_rebased_patch_landed_allows() {
+  local case_dir rc
+  case_dir=$(make_case rebased-landed)
+  write_meta "$case_dir" local-only ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  # main gained an unrelated commit, so landing this branch needed a rebase; the
+  # branch's own commit is now unreachable from main while its patch is fully there.
+  land_rewritten_patch_on_local_main "$case_dir" feature.txt hello
+  git -C "$case_dir/wt" merge-base --is-ancestor HEAD main 2>/dev/null \
+    && fail "rebased-landed: branch commit is still reachable from main; case is vacuous"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "rebased-landed: teardown should succeed when the patch landed under a rewritten commit"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "rebased-landed: teardown printed a REFUSED line"
+  pass "local-only worktree whose patch landed under a rewritten commit is torn down"
+}
+
+test_local_only_rebased_patch_with_absent_commit_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-partial)
+  write_meta "$case_dir" local-only ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  # A second commit whose patch never reaches main: patch equivalence must not
+  # excuse it just because the first commit's patch did land.
+  wt_commit_file "$case_dir" extra.txt "still here" "add extra"
+  land_rewritten_patch_on_local_main "$case_dir" feature.txt hello
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-partial: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-partial: no REFUSED line in stderr"
+  grep -Fq "commits not yet on main" "$case_dir/stderr" \
+    || fail "rebased-partial: refusal did not name the commits still missing from main"
+  pass "local-only worktree with a commit whose patch is absent from main is refused"
+}
+
+test_local_only_rebased_patch_landed_but_dirty_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-dirty)
+  write_meta "$case_dir" local-only ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  land_rewritten_patch_on_local_main "$case_dir" feature.txt hello
+  # Every commit's patch landed, but the worktree still holds uncommitted work.
+  printf '%s\n' "not committed anywhere" > "$case_dir/wt/scratch.txt"
+  git -C "$case_dir/wt" add -- scratch.txt
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-dirty: teardown should refuse on uncommitted changes"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-dirty: no REFUSED line in stderr"
+  grep -Fq "uncommitted changes present" "$case_dir/stderr" \
+    || fail "rebased-dirty: refusal did not name the uncommitted changes"
+  pass "worktree with uncommitted changes is refused even when every commit's patch landed"
+}
+
+test_no_mistakes_rebased_patch_landed_after_later_edit_allows() {
+  local case_dir rc
+  case_dir=$(make_case nm-rebased-landed)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  # The patch landed on origin/main under a rewritten commit, then main edited the
+  # same file again. The whole-tree content check cannot conclude anything from
+  # that, so only patch equivalence proves the branch's work is already in.
+  land_rewritten_patch_then_edit_on_origin_main "$case_dir" feature.txt hello revised
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "nm-rebased-landed: teardown should succeed when the patch landed under a rewritten commit"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "nm-rebased-landed: teardown printed a REFUSED line"
+  pass "no-mistakes worktree whose patch landed under a rewritten commit is torn down"
 }
 
 test_no_mistakes_origin_remote_allows() {
@@ -2596,6 +2730,10 @@ test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
 test_local_only_truly_unpushed_refuses
 test_local_only_merged_to_local_main_allows
+test_local_only_rebased_patch_landed_allows
+test_local_only_rebased_patch_with_absent_commit_refuses
+test_local_only_rebased_patch_landed_but_dirty_refuses
+test_no_mistakes_rebased_patch_landed_after_later_edit_allows
 test_no_mistakes_origin_remote_allows
 test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed

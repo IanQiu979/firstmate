@@ -9,10 +9,13 @@
 # reachable from any remote-tracking branch (a fork counts as a remote, so
 # upstream-contribution PRs pushed to a fork satisfy this in any mode), OR - for a
 # normal ship task whose commits are not so reachable - when its PR is merged and
-# GitHub reports a PR head that contains the current local work, or its content is
-# already present in the up-to-date default branch. This recognizes the common
+# GitHub reports a PR head that contains the current local work, its content is
+# already present in the up-to-date default branch, or every commit that branch
+# cannot reach is already present there as a PATCH. This recognizes the common
 # squash-merge-then-delete-branch flow, where the branch's own commits live nowhere
-# on a remote yet the change is fully in main.
+# on a remote yet the change is fully in main, and the rebase case, where landing
+# rewrote every commit so no reachability test can ever succeed again (see
+# patches_are_in_ref).
 # The PR itself is resolved from the task's recorded pr= when present, or - when
 # no pr= was ever recorded (e.g. a yolo-authorized merge on a repo with no PR CI,
 # where the usual "checks green" fm-pr-check.sh trigger never fires) - by looking
@@ -24,7 +27,10 @@
 # Uncommitted changes are never landed.
 # local-only projects additionally accept work merged into the local default
 # branch (firstmate performs that merge after configured approval) as a fallback
-# for the common case where there is no remote at all.
+# for the common case where there is no remote at all, by the same reachability-
+# or-patch test. That path matters most there: bin/fm-merge-local.sh is
+# fast-forward-only, so every chain landing into a moved default branch rebases
+# first and leaves its earlier nodes with rewritten commits.
 # Scout tasks (kind=scout in meta) carve out of that check: their worktree is
 # declared scratch and the report at data/<task-id>/report.md is the work
 # product. Teardown proceeds only once the report exists and the shared
@@ -1094,24 +1100,31 @@ pr_is_merged() {
   unpushed_patches_are_in_pr_head "$head"
 }
 
-# Is the branch's content already present in the up-to-date default branch? Fetches
-# first, then 3-way merges the default branch with HEAD: when HEAD introduces nothing
-# the default branch does not already contain (e.g. its change landed via squash) the
-# merged tree equals the default branch's tree. This isolates branch-only changes, so
-# unrelated commits the default branch gained past the merge-base do not count as
-# "added". Returns non-zero when inconclusive (no default ref, or a merge conflict),
-# so the caller refuses rather than guesses.
-content_in_default() {
-  local name ref default_tree merged_tree
+# The up-to-date default-branch ref to test landing against: origin's
+# remote-tracking ref after a fetch when the worktree has an origin, otherwise the
+# local default branch. Returns non-zero when neither exists, so callers stay
+# inconclusive rather than guessing.
+default_landing_ref() {
+  local name
   name=$(default_branch) || return 1
   if git -C "$WT" remote get-url origin >/dev/null 2>&1; then
     git -C "$WT" fetch --quiet origin "+refs/heads/$name:refs/remotes/origin/$name" >/dev/null 2>&1 || return 1
-    ref="refs/remotes/origin/$name"
-  elif git -C "$WT" rev-parse --quiet --verify "refs/heads/$name" >/dev/null 2>&1; then
-    ref="refs/heads/$name"
-  else
-    return 1
+    printf '%s\n' "refs/remotes/origin/$name"
+    return 0
   fi
+  git -C "$WT" rev-parse --quiet --verify "refs/heads/$name" >/dev/null 2>&1 || return 1
+  printf '%s\n' "refs/heads/$name"
+}
+
+# Is the branch's content already present in <ref>? 3-way merges that ref with
+# HEAD: when HEAD introduces nothing the ref does not already contain (e.g. its
+# change landed via squash) the merged tree equals the ref's tree. This isolates
+# branch-only changes, so unrelated commits the ref gained past the merge-base do
+# not count as "added". Returns non-zero when inconclusive (a merge conflict, or a
+# ref with no tree), so the caller refuses rather than guesses.
+content_in_ref() {
+  local ref=$1 default_tree merged_tree
+  [ -n "$ref" ] || return 1
   default_tree=$(git -C "$WT" rev-parse --quiet --verify "$ref^{tree}" 2>/dev/null) || return 1
   [ -n "$default_tree" ] || return 1
   merged_tree=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null) || return 1
@@ -1119,15 +1132,55 @@ content_in_default() {
   [ "$merged_tree" = "$default_tree" ]
 }
 
+# Is every commit HEAD holds that <ref> cannot reach already present in <ref> as a
+# PATCH? This is the relationship `git cherry` reports, and it is the only one that
+# can recognize work landed under REWRITTEN commits: a rebase gives every commit a
+# new object id, so reachability alone can never be satisfied afterwards even when
+# the content is fully in. Rebasing is the normal way work lands here, because
+# bin/fm-merge-local.sh is fast-forward-only, so a second chain landing into a moved
+# default branch must rebase first.
+# Deliberately strict, so it can only ever turn a refusal into an allow on proof:
+# EVERY unreachable commit must match, an unreadable or empty patch (an empty
+# commit, or a merge commit, whose conflict resolution `git show` does not emit)
+# never counts as landed, and a ref that contributes no patches at all is
+# inconclusive. Anything short of a complete match returns non-zero, so genuinely
+# unlanded work still refuses.
+patches_are_in_ref() {
+  local ref=$1 local_commits landed_ids commit patch_id
+  [ -n "$ref" ] || return 1
+  local_commits=$(git -C "$WT" log --format=%H HEAD --not "$ref" -- 2>/dev/null) || return 1
+  [ -n "$local_commits" ] || return 0
+  landed_ids=$(
+    git -C "$WT" log --format=%H "$ref" --not HEAD -- 2>/dev/null \
+      | while IFS= read -r commit; do
+          patch_id_for_commit "$commit"
+        done \
+      | sed '/^$/d' \
+      | sort -u
+  ) || return 1
+  [ -n "$landed_ids" ] || return 1
+  while IFS= read -r commit; do
+    [ -n "$commit" ] || continue
+    patch_id=$(patch_id_for_commit "$commit") || return 1
+    [ -n "$patch_id" ] || return 1
+    printf '%s\n' "$landed_ids" | grep -qxF "$patch_id" || return 1
+  done <<EOF
+$local_commits
+EOF
+}
+
 # Has the worktree's committed work actually LANDED, though its commits are not
 # reachable from any remote-tracking branch? True when a merged PR proves the
 # current local work is contained in the PR head, OR the content is already in the
-# default branch (fallback, which also covers the no-PR and gh-error paths). False
-# only for genuinely unlanded work.
+# default branch, OR every commit the default branch cannot reach is already there
+# as a patch (the rebase case). The two default-branch fallbacks also cover the
+# no-PR and gh-error paths. False only for genuinely unlanded work.
 work_is_landed() {
-  local branch=$1
+  local branch=$1 ref
   pr_is_merged "$branch" && return 0
-  content_in_default
+  ref=$(default_landing_ref) || return 1
+  content_in_ref "$ref" && return 0
+  patches_are_in_ref "$ref"
 }
 
 backlog_refresh_reminder() {
@@ -1411,6 +1464,13 @@ validate_worktree_teardown_safety() {
       return 1
     fi
     unmerged=$(printf '%s\n' "$unmerged_raw" | head -5)
+    # Reachability alone can never recognize a branch whose commits were rewritten
+    # by the rebase that landed them, so consult patch equivalence before refusing.
+    # It clears only commits it can prove are already in $DEFAULT; the uncommitted
+    # check below is untouched, and anything unproven still refuses.
+    if [ -n "$unmerged" ] && patches_are_in_ref "$DEFAULT"; then
+      unmerged=
+    fi
     if [ -n "$dirty" ] || [ -n "$unmerged" ]; then
       echo "REFUSED: local-only worktree $WT has work not yet merged into $DEFAULT and not on any remote." >&2
       [ -n "$dirty" ] && echo "uncommitted changes present" >&2
