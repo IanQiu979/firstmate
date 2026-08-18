@@ -764,6 +764,12 @@ test_local_only_rebased_patch_landed_but_dirty_refuses() {
   grep -q REFUSED "$case_dir/stderr" || fail "rebased-dirty: no REFUSED line in stderr"
   grep -Fq "uncommitted changes present" "$case_dir/stderr" \
     || fail "rebased-dirty: refusal did not name the uncommitted changes"
+  grep -Fq "its commits already landed in" "$case_dir/stderr" \
+    || fail "rebased-dirty: refusal did not credit the commits as already landed"
+  grep -Fq "Commit the uncommitted changes" "$case_dir/stderr" \
+    || fail "rebased-dirty: refusal did not point at the uncommitted change"
+  ! grep -Eq "not yet merged into|Merge the branch into local" "$case_dir/stderr" \
+    || fail "rebased-dirty: refusal still claims the branch has unmerged work"
   pass "worktree with uncommitted changes is refused even when every commit's patch landed"
 }
 

@@ -1047,29 +1047,55 @@ patch_id_for_commit() {
     | awk 'NR == 1 { print $1 }'
 }
 
-unpushed_patches_are_in_pr_head() {
-  local pr_head=$1 current base pr_patch_ids commit patch_id unpushed
-  current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
-  base=$(git -C "$WT" merge-base "$current" "$pr_head" 2>/dev/null) || return 1
-  pr_patch_ids=$(
-    git -C "$WT" log --format=%H "$base..$pr_head" -- 2>/dev/null \
+# The one patch-set comparison behind every landed-work patch check, so a future
+# fix to it can never land on only one copy. Takes the reference-side `git log`
+# arguments, the literal separator `::`, then the subject-side ones. Returns 0
+# when EVERY subject commit's patch is already present on the reference side, 2
+# when the subject side is empty so there is nothing to prove (the caller decides
+# what that means), and 1 for everything else: an unreadable git log, a reference
+# side that contributes no patch ids at all, an empty or unreadable subject patch
+# id, or any subject commit whose patch is missing.
+subject_patches_are_in_reference() {
+  local -a ref_args=() subject_args=()
+  local past_separator=0 arg ref_ids subject_commits commit patch_id
+  for arg in "$@"; do
+    if [ "$past_separator" = 0 ] && [ "$arg" = '::' ]; then
+      past_separator=1
+      continue
+    fi
+    if [ "$past_separator" = 0 ]; then
+      ref_args+=("$arg")
+    else
+      subject_args+=("$arg")
+    fi
+  done
+  [ "${#ref_args[@]}" -gt 0 ] && [ "${#subject_args[@]}" -gt 0 ] || return 1
+  subject_commits=$(git -C "$WT" log --format=%H "${subject_args[@]}" -- 2>/dev/null) || return 1
+  [ -n "$subject_commits" ] || return 2
+  ref_ids=$(
+    git -C "$WT" log --format=%H "${ref_args[@]}" -- 2>/dev/null \
       | while IFS= read -r commit; do
           patch_id_for_commit "$commit"
         done \
       | sed '/^$/d' \
       | sort -u
   ) || return 1
-  [ -n "$pr_patch_ids" ] || return 1
-  unpushed=$(git -C "$WT" log --format=%H HEAD --not --remotes -- 2>/dev/null) || return 1
-  [ -n "$unpushed" ] || return 1
+  [ -n "$ref_ids" ] || return 1
   while IFS= read -r commit; do
     [ -n "$commit" ] || continue
     patch_id=$(patch_id_for_commit "$commit") || return 1
     [ -n "$patch_id" ] || return 1
-    printf '%s\n' "$pr_patch_ids" | grep -qxF "$patch_id" || return 1
+    printf '%s\n' "$ref_ids" | grep -qxF "$patch_id" || return 1
   done <<EOF
-$unpushed
+$subject_commits
 EOF
+}
+
+unpushed_patches_are_in_pr_head() {
+  local pr_head=$1 current base
+  current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
+  base=$(git -C "$WT" merge-base "$current" "$pr_head" 2>/dev/null) || return 1
+  subject_patches_are_in_reference "$base..$pr_head" :: HEAD --not --remotes
 }
 
 # Is the worktree's PR merged for local work contained in that PR? Resolves the
@@ -1146,27 +1172,11 @@ content_in_ref() {
 # inconclusive. Anything short of a complete match returns non-zero, so genuinely
 # unlanded work still refuses.
 patches_are_in_ref() {
-  local ref=$1 local_commits landed_ids commit patch_id
+  local ref=$1 status
   [ -n "$ref" ] || return 1
-  local_commits=$(git -C "$WT" log --format=%H HEAD --not "$ref" -- 2>/dev/null) || return 1
-  [ -n "$local_commits" ] || return 0
-  landed_ids=$(
-    git -C "$WT" log --format=%H "$ref" --not HEAD -- 2>/dev/null \
-      | while IFS= read -r commit; do
-          patch_id_for_commit "$commit"
-        done \
-      | sed '/^$/d' \
-      | sort -u
-  ) || return 1
-  [ -n "$landed_ids" ] || return 1
-  while IFS= read -r commit; do
-    [ -n "$commit" ] || continue
-    patch_id=$(patch_id_for_commit "$commit") || return 1
-    [ -n "$patch_id" ] || return 1
-    printf '%s\n' "$landed_ids" | grep -qxF "$patch_id" || return 1
-  done <<EOF
-$local_commits
-EOF
+  subject_patches_are_in_reference "$ref" --not HEAD :: HEAD --not "$ref"
+  status=$?
+  [ "$status" -eq 0 ] || [ "$status" -eq 2 ]
 }
 
 # Has the worktree's committed work actually LANDED, though its commits are not
@@ -1426,7 +1436,7 @@ teardown_treehouse_return() {
 }
 
 validate_worktree_teardown_safety() {
-  local dirty_raw dirty unpushed_raw unpushed DEFAULT unmerged_raw unmerged branch
+  local dirty_raw dirty unpushed_raw unpushed DEFAULT unmerged_raw unmerged branch landed_by_patch
   [ -d "$WT" ] || return 0
   [ "$FORCE" != "--force" ] || return 0
   case "$KIND" in
@@ -1468,8 +1478,16 @@ validate_worktree_teardown_safety() {
     # by the rebase that landed them, so consult patch equivalence before refusing.
     # It clears only commits it can prove are already in $DEFAULT; the uncommitted
     # check below is untouched, and anything unproven still refuses.
+    landed_by_patch=0
     if [ -n "$unmerged" ] && patches_are_in_ref "$DEFAULT"; then
       unmerged=
+      landed_by_patch=1
+    fi
+    if [ "$landed_by_patch" = 1 ] && [ -n "$dirty" ]; then
+      echo "REFUSED: local-only worktree $WT has uncommitted changes; its commits already landed in $DEFAULT." >&2
+      echo "uncommitted changes present" >&2
+      echo "Commit the uncommitted changes (or get the captain's explicit OK to discard, then --force)." >&2
+      return 1
     fi
     if [ -n "$dirty" ] || [ -n "$unmerged" ]; then
       echo "REFUSED: local-only worktree $WT has work not yet merged into $DEFAULT and not on any remote." >&2
