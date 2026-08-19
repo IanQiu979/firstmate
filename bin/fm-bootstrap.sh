@@ -39,7 +39,12 @@
 #          fm_backend_agent_alive, distinct from endpoint pane-presence):
 #          skipped means the probe could not confidently classify the endpoint,
 #          and respawn failed means relaunch did not complete. Already-live and
-#          successfully respawned secondmates are silent.
+#          successfully respawned secondmates are silent. A secondmate
+#          registered in data/secondmates.md with no matching state/<id>.meta
+#          (kind=secondmate) is also reported as
+#          "SECONDMATE_LIVENESS: secondmate <id>: skipped: no runtime record",
+#          so a registry entry that lost or never gained its runtime record is
+#          never silently unaccounted for.
 #          A TANGLE line means the firstmate primary checkout (FM_ROOT) is stranded
 #          on a feature branch instead of its default branch - a crewmate's work
 #          landed in the primary instead of its own worktree; restore it per the line.
@@ -476,6 +481,27 @@ secondmate_liveness_sweep() {
         ;;
     esac
   done
+  # The loop above only ever sees a secondmate that already has a
+  # state/<id>.meta record. A secondmate registered in data/secondmates.md
+  # that has none - crash, manual cleanup, a home restored from backup, or a
+  # partial teardown that dropped the meta - is otherwise invisible to this
+  # sweep and never reported. Enumerate the registry and report each such
+  # entry explicitly so the liveness guarantee covers every REGISTERED
+  # secondmate, not only every one with surviving runtime metadata.
+  if [ -f "$DATA/secondmates.md" ]; then
+    local reg_line reg_id
+    while IFS= read -r reg_line; do
+      case "$reg_line" in
+        "- "*)
+          reg_id=${reg_line#- }
+          reg_id=${reg_id%% *}
+          [ -n "$reg_id" ] || continue
+          grep -q '^kind=secondmate$' "$STATE/$reg_id.meta" 2>/dev/null && continue
+          echo "SECONDMATE_LIVENESS: secondmate $reg_id: skipped: no runtime record"
+          ;;
+      esac
+    done < "$DATA/secondmates.md"
+  fi
   return 0
 }
 

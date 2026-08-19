@@ -34,6 +34,11 @@
 #   - The sweep is naturally scoped to the primary: with no kind=secondmate
 #     meta present (a secondmate's own state/ never holds one, since
 #     secondmates never spawn secondmates), it is a silent no-op.
+#   - The sweep also enumerates data/secondmates.md directly: a registered
+#     secondmate with no matching state/<id>.meta (kind=secondmate) at all -
+#     lost or never gained its runtime record - is reported as
+#     "SECONDMATE_LIVENESS: secondmate <id>: skipped: no runtime record"
+#     rather than being invisible to the meta-only loop above.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -384,6 +389,45 @@ test_sweep_skipped_under_detect_only() {
   pass "sweep: skipped entirely under FM_BOOTSTRAP_DETECT_ONLY=1, exactly like the other mutating sweeps"
 }
 
+test_sweep_reports_registered_secondmate_with_no_runtime_record() {
+  local w fb tmuxfb log out sm_home
+  w=$(new_world sweep-registry-only)
+  # A registered secondmate with no state/<id>.meta at all - crash, manual
+  # cleanup, a home restored from backup, or a partial teardown that dropped
+  # the meta. The enumerate-the-registry guarantee must catch exactly this,
+  # since the meta-only loop above never sees it.
+  sm_home="$w/sm-orphan"
+  mkdir -p "$sm_home" "$w/home/data"
+  printf -- '- sm-orphan - orphaned secondmate (home: %s; scope: test; projects: none; added 2026-08-01)\n' \
+    "$sm_home" > "$w/home/data/secondmates.md"
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+
+  out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log")
+
+  assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm-orphan: skipped: no runtime record" \
+    "a registered secondmate with no matching runtime meta must be reported as skipped, not silently unaccounted for"
+  [ ! -s "$log" ] || fail "a registry-only entry with no runtime record must never be killed or respawned: $(cat "$log")"
+  pass "sweep: a registered secondmate with no runtime record is reported, not silently skipped"
+}
+
+test_sweep_registered_secondmate_with_runtime_record_stays_silent() {
+  local w fb tmuxfb log out
+  w=$(new_world sweep-registry-covered)
+  add_sm_home "$w" sm1 firstmate:fm-sm1
+  mkdir -p "$w/home/data"
+  printf -- '- sm1 - covered secondmate (home: %s/sm1; scope: test; projects: none; added 2026-08-01)\n' \
+    "$w" > "$w/home/data/secondmates.md"
+  fb=$(make_toolchain "$w"); tmuxfb=$(make_liveness_tmux "$w")
+  log="$w/calls.log"; : > "$log"
+
+  out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" claude "$log")
+
+  assert_not_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: skipped: no runtime record" \
+    "a registered secondmate with a live runtime record must not also be reported as missing one"
+  pass "sweep: a registered secondmate with a surviving runtime record is not double-reported"
+}
+
 test_sweep_noop_with_no_secondmate_meta() {
   local w fb tmuxfb log out
   w=$(new_world sweep-no-secondmates)
@@ -410,6 +454,8 @@ test_sweep_never_acts_on_inconclusive_reading
 test_sweep_never_acts_on_unverified_harness_dead_reading
 test_sweep_converges_no_retouch_once_alive
 test_sweep_skipped_under_detect_only
+test_sweep_reports_registered_secondmate_with_no_runtime_record
+test_sweep_registered_secondmate_with_runtime_record_stays_silent
 test_sweep_noop_with_no_secondmate_meta
 
 echo "# all fm-secondmate-liveness tests passed"
