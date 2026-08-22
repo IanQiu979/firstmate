@@ -52,6 +52,7 @@
 #   (q2d) local-only + two landed patches jointly reverted      -> REFUSE (safety)
 #   (q2e) local-only + one file of landed patch reverted         -> REFUSE (safety)
 #   (q2f) local-only + reverted patch re-landed                  -> ALLOW  (current state)
+#   (q2g) local-only + one same-file hunk reverted               -> REFUSE (safety)
 #   (q3) local-only + every patch landed but worktree dirty     -> REFUSE (dirty wins)
 #   (q4) no-mistakes + patch landed, main edited it afterwards  -> ALLOW  (rebase fix)
 #   (q5) local-only + rewritten rename patch landed              -> ALLOW  (rename fix)
@@ -968,6 +969,52 @@ test_local_only_rebased_patch_reverted_then_relanded_allows() {
   expect_code 0 "$rc" "rebased-relanded: teardown should accept the final landed state"
   ! grep -q REFUSED "$case_dir/stderr" || fail "rebased-relanded: teardown printed a REFUSED line"
   pass "local-only worktree whose reverted patch was re-landed is torn down"
+}
+
+test_local_only_rebased_same_file_hunk_partially_reverted_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-hunk-revert)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "add baseline"
+  git -C "$case_dir/wt" rebase main >/dev/null
+
+  sed -e 's/^a2$/landed-two/' -e 's/^a11$/landed-eleven/' "$case_dir/wt/shared.txt" > "$case_dir/wt/shared.next"
+  mv "$case_dir/wt/shared.next" "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change two separated hunks"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  sed -e 's/^a2$/landed-two/' -e 's/^a11$/landed-eleven/' "$case_dir/project/shared.txt" > "$case_dir/project/shared.next"
+  mv "$case_dir/project/shared.next" "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten separated hunks"
+  sed 's/^landed-eleven$/a11/' "$case_dir/project/shared.txt" > "$case_dir/project/shared.next"
+  mv "$case_dir/project/shared.next" "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "revert second hunk"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-hunk-revert: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-hunk-revert: no REFUSED line in stderr"
+  [ ! -e "$case_dir/treehouse-called" ] || fail "rebased-hunk-revert: destructive return was invoked"
+  grep -Fxq landed-eleven "$case_dir/wt/shared.txt" || fail "rebased-hunk-revert: worktree hunk was discarded"
+  pass "local-only worktree whose same-file patch was partially reverted is refused"
 }
 
 test_local_only_rewritten_rename_patch_landed_allows() {
@@ -3017,6 +3064,7 @@ test_local_only_rebased_patch_combined_revert_on_main_refuses
 test_local_only_rebased_patch_sequence_jointly_reverted_on_main_refuses
 test_local_only_rebased_multifile_patch_partially_reverted_on_main_refuses
 test_local_only_rebased_patch_reverted_then_relanded_allows
+test_local_only_rebased_same_file_hunk_partially_reverted_refuses
 test_local_only_rebased_patch_landed_but_dirty_refuses
 test_no_mistakes_rebased_patch_landed_after_later_edit_allows
 test_local_only_rewritten_rename_patch_landed_allows

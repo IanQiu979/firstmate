@@ -1120,6 +1120,47 @@ patch_applies_to_tree() {
   esac
 }
 
+patch_parts_are_represented_in_tree() {
+  local patch=$1 tree=$2 tmp=$3 fragment_count fragment status i
+  fragment_count=$(awk -v prefix="$tmp/fragment." '
+    BEGIN { count = 0; header_count = 0; file = "" }
+    count == 0 && $0 !~ /^@@ / { header[++header_count] = $0; next }
+    /^@@ / {
+      if (file != "") close(file)
+      count++
+      file = prefix count
+      for (i = 1; i <= header_count; i++) print header[i] > file
+      print $0 > file
+      next
+    }
+    count > 0 { print $0 > file }
+    END {
+      if (file != "") close(file)
+      print count
+    }
+  ' "$patch") || return 1
+  case "$fragment_count" in
+    0)
+      patch_applies_to_tree "$patch" "$tree" forward
+      status=$?
+      ;;
+    *[!0-9]*|'') return 1 ;;
+    *)
+      status=1
+      i=1
+      while [ "$i" -le "$fragment_count" ]; do
+        fragment="$tmp/fragment.$i"
+        [ -s "$fragment" ] || return 1
+        patch_applies_to_tree "$fragment" "$tree" forward
+        status=$?
+        [ "$status" -eq 1 ] || break
+        i=$((i + 1))
+      done
+      ;;
+  esac
+  [ "$status" -eq 1 ]
+}
+
 commit_paths_are_represented_in_tree() {
   local commit=$1 tree=$2 paths path tmp status
   paths=$(git -C "$WT" -c core.quotePath=false show --format= --name-only --no-renames "$commit" -- 2>/dev/null) || return 1
@@ -1137,21 +1178,14 @@ commit_paths_are_represented_in_tree() {
       rmdir "$tmp" 2>/dev/null || true
       return 1
     }
-    patch_applies_to_tree "$tmp/patch" "$tree" forward
+    patch_parts_are_represented_in_tree "$tmp/patch" "$tree" "$tmp"
     status=$?
-    case "$status" in
-      0)
-        rm -f -- "$tmp/patch"
-        rmdir "$tmp" 2>/dev/null || true
-        return 1
-        ;;
-      1) ;;
-      *)
-        rm -f -- "$tmp/patch"
-        rmdir "$tmp" 2>/dev/null || true
-        return 1
-        ;;
-    esac
+    rm -f -- "$tmp"/fragment.*
+    [ "$status" -eq 0 ] || {
+      rm -f -- "$tmp/patch"
+      rmdir "$tmp" 2>/dev/null || true
+      return 1
+    }
   done <<EOF
 $paths
 EOF
