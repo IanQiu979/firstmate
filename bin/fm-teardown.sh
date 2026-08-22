@@ -1298,7 +1298,12 @@ EOF
   subject_base=$(git -C "$WT" rev-parse --verify "$subject_oldest^" 2>/dev/null) || return 1
   git -C "$WT" diff --quiet --no-ext-diff --no-renames "$subject_base" "$subject_tip" -- 2>/dev/null
   status=$?
-  [ "$status" -ne 0 ] || return 0
+  if [ "$status" -eq 0 ]; then
+    git -C "$WT" diff --quiet --no-ext-diff --no-renames "$subject_tip" "$reference_tree" -- \
+      "${pathspecs[@]}" 2>/dev/null
+    [ "$?" -eq 0 ] || return 1
+    return 0
+  fi
   [ "$status" -eq 1 ] || return 1
   changes_are_represented_in_tree "$subject_base" "$subject_tip" "$reference_tree"
 }

@@ -60,6 +60,7 @@
 #   (q2l) local-only + landed trailing newline removed            -> REFUSE (safety)
 #   (q2m) local-only + landed change relocated elsewhere          -> REFUSE (safety)
 #   (q2n) local-only + rewritten inverse sequence is net zero     -> ALLOW  (current state)
+#   (q2o) local-only + net-zero inverse later reverted             -> REFUSE (safety)
 #   (q3) local-only + every patch landed but worktree dirty     -> REFUSE (dirty wins)
 #   (q4) no-mistakes + patch landed, all its content replaced   -> REFUSE (safety)
 #   (q5) local-only + rewritten rename patch landed              -> ALLOW  (rename fix)
@@ -1078,6 +1079,54 @@ SH
   ! grep -q REFUSED "$case_dir/stderr" || fail "rebased-net-zero-sequence: teardown printed a REFUSED line"
   [ -e "$case_dir/treehouse-called" ] || fail "rebased-net-zero-sequence: teardown did not invoke worktree return"
   pass "local-only worktree whose rewritten inverse patches net to zero is torn down"
+}
+
+test_local_only_rebased_net_zero_inverse_later_reverted_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-net-zero-inverse-reverted)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' x > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "add baseline"
+  git -C "$case_dir/wt" rebase main >/dev/null
+  printf '%s\n' y > "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change x to y"
+  printf '%s\n' x > "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change y back to x"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' y > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten x to y"
+  printf '%s\n' x > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten y back to x"
+  printf '%s\n' y > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "revert rewritten inverse"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-net-zero-inverse-reverted: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-net-zero-inverse-reverted: no REFUSED line in stderr"
+  [ ! -e "$case_dir/treehouse-called" ] || fail "rebased-net-zero-inverse-reverted: destructive return was invoked"
+  grep -Fxq x "$case_dir/wt/shared.txt" || fail "rebased-net-zero-inverse-reverted: worktree content was discarded"
+  pass "local-only net-zero worktree whose inverse was later reverted is refused"
 }
 
 test_local_only_rebased_same_file_hunk_partially_reverted_refuses() {
@@ -3373,6 +3422,7 @@ test_local_only_rebased_multifile_patch_partially_reverted_on_main_refuses
 test_local_only_rebased_patch_reverted_then_relanded_allows
 test_local_only_rebased_patch_relocated_to_identical_block_refuses
 test_local_only_rebased_inverse_sequence_with_net_zero_change_allows
+test_local_only_rebased_net_zero_inverse_later_reverted_refuses
 test_local_only_rebased_same_file_hunk_partially_reverted_refuses
 test_local_only_rebased_added_line_partially_reverted_refuses
 test_local_only_rebased_added_line_replaced_refuses
