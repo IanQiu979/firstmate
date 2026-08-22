@@ -48,8 +48,11 @@
 #   (q1) local-only + patch landed under a rewritten commit     -> ALLOW  (rebase fix)
 #   (q2) local-only + one commit's patch absent from main       -> REFUSE (safety)
 #   (q2b) local-only + landed patch reverted on main again      -> REFUSE (safety)
+#   (q2c) local-only + combined revert on main                   -> REFUSE (safety)
 #   (q3) local-only + every patch landed but worktree dirty     -> REFUSE (dirty wins)
 #   (q4) no-mistakes + patch landed, main edited it afterwards  -> ALLOW  (rebase fix)
+#   (q5) local-only + rewritten rename patch landed              -> ALLOW  (rename fix)
+#   (q6) patch-history read fails after emitting output          -> REFUSE (fail-safe)
 #
 # Also covers backlog teardown-lock-race: a git index.lock left in the worktree by a
 # killed crew process (bin/fm-teardown.sh's teardown_treehouse_return).
@@ -315,6 +318,27 @@ land_rewritten_patch_then_edit_on_origin_main() {
   git -C "$tmp" -c user.email=t@t -c user.name=t commit -q -m "follow-up edit of $file"
   git -C "$tmp" push -q origin HEAD:main
   rm -rf "$tmp"
+}
+
+add_git_patch_log_failure() {
+  local case_dir=$1
+  cat > "$case_dir/fakebin/git" <<'SH'
+#!/usr/bin/env bash
+real=${REAL_GIT_FOR_TEST:?}
+args=("$@")
+is_log=0
+is_patch=0
+for arg in "$@"; do
+  [ "$arg" = log ] && is_log=1
+  [ "$arg" = -p ] && is_patch=1
+done
+if [ "$is_log" = 1 ] && [ "$is_patch" = 1 ]; then
+  "$real" "${args[@]}"
+  exit 86
+fi
+exec "$real" "${args[@]}"
+SH
+  chmod +x "$case_dir/fakebin/git"
 }
 
 # Override GitHub lookups to report PR 7 as merged with the supplied head.
@@ -780,6 +804,90 @@ test_local_only_rebased_patch_reverted_on_main_refuses() {
     || fail "rebased-reverted: refusal did not name the commits still missing from main"
   [ -e "$case_dir/wt/feature.txt" ] || fail "rebased-reverted: worktree work was discarded"
   pass "local-only worktree whose landed patch was reverted on main is refused"
+}
+
+test_local_only_rebased_patch_combined_revert_on_main_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-combined-revert)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' baseline > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "add baseline"
+  git -C "$case_dir/wt" rebase main >/dev/null
+
+  printf '%s\n' feature > "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change shared feature"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' feature > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten feature"
+  printf '%s\n' baseline 'unrelated retained' > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "revert feature with other work"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-combined-revert: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-combined-revert: no REFUSED line in stderr"
+  [ -e "$case_dir/wt/shared.txt" ] || fail "rebased-combined-revert: worktree work was discarded"
+  pass "local-only worktree whose patch was reverted with other work is refused"
+}
+
+test_local_only_rewritten_rename_patch_landed_allows() {
+  local case_dir rc
+  case_dir=$(make_case rewritten-rename)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' payload > "$case_dir/project/old-name.txt"
+  git -C "$case_dir/project" add -- old-name.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "add rename source"
+  git -C "$case_dir/wt" rebase main >/dev/null
+  git -C "$case_dir/wt" mv old-name.txt new-name.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "rename source"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  git -C "$case_dir/project" mv old-name.txt new-name.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten rename"
+  git -C "$case_dir/wt" merge-base --is-ancestor HEAD main 2>/dev/null \
+    && fail "rewritten-rename: branch commit is still reachable from main"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "rewritten-rename: teardown should accept the landed rename patch"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "rewritten-rename: teardown printed a REFUSED line"
+  pass "local-only worktree whose rename landed under a rewritten commit is torn down"
+}
+
+test_patch_log_failure_after_output_refuses() {
+  local case_dir rc
+  case_dir=$(make_case patch-log-failure)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  land_rewritten_patch_then_edit_on_origin_main "$case_dir" feature.txt hello revised
+  add_git_patch_log_failure "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "patch-log-failure: teardown should fail closed"
+  grep -q REFUSED "$case_dir/stderr" || fail "patch-log-failure: no REFUSED line in stderr"
+  [ -e "$case_dir/wt/feature.txt" ] || fail "patch-log-failure: worktree work was discarded"
+  pass "partial patch-history output cannot authorize teardown"
 }
 
 test_local_only_rebased_patch_landed_but_dirty_refuses() {
@@ -2776,8 +2884,11 @@ test_local_only_merged_to_local_main_allows
 test_local_only_rebased_patch_landed_allows
 test_local_only_rebased_patch_with_absent_commit_refuses
 test_local_only_rebased_patch_reverted_on_main_refuses
+test_local_only_rebased_patch_combined_revert_on_main_refuses
 test_local_only_rebased_patch_landed_but_dirty_refuses
 test_no_mistakes_rebased_patch_landed_after_later_edit_allows
+test_local_only_rewritten_rename_patch_landed_allows
+test_patch_log_failure_after_output_refuses
 test_no_mistakes_origin_remote_allows
 test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed

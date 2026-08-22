@@ -1047,10 +1047,24 @@ ensure_commit_object() {
 # different ids and the revert check below could never match. It only has to be
 # consistent, since every id compared here is computed in the same repository.
 patch_id_for_commit() {
-  local commit=$1
-  git -C "$WT" show --pretty=medium --no-ext-diff --no-prefix "$commit" 2>/dev/null \
-    | git patch-id --stable 2>/dev/null \
-    | awk 'NR == 1 { print $1 }'
+  local commit=$1 tmp patch_output status
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-patch-id.XXXXXX") || return 1
+  if ! git -C "$WT" show --pretty=medium --no-ext-diff --no-prefix "$commit" > "$tmp/patch" 2>/dev/null; then
+    rm -f -- "$tmp/patch"
+    rmdir "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! git patch-id --stable < "$tmp/patch" > "$tmp/ids" 2>/dev/null; then
+    rm -f -- "$tmp/patch" "$tmp/ids"
+    rmdir "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  patch_output=$(awk 'NR == 1 { print $1 }' "$tmp/ids")
+  status=$?
+  rm -f -- "$tmp/patch" "$tmp/ids"
+  rmdir "$tmp" 2>/dev/null || true
+  [ "$status" -eq 0 ] || return 1
+  printf '%s\n' "$patch_output"
 }
 
 # Every distinct patch id the commits <git log args...> select carry, as ONE
@@ -1061,10 +1075,104 @@ patch_id_for_commit() {
 # `git log -p` does not show) contribute nothing, which is what the reference side
 # wants: they can never prove a subject patch is present.
 patch_ids_for_log() {
-  git -C "$WT" log --format=%H --no-ext-diff --no-prefix -p "$@" 2>/dev/null \
-    | git patch-id --stable 2>/dev/null \
-    | awk 'NF { print $1 }' \
-    | sort -u
+  local tmp status
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-patch-log.XXXXXX") || return 1
+  if ! git -C "$WT" log --format=%H --no-ext-diff --no-prefix -p "$@" > "$tmp/patches" 2>/dev/null; then
+    rm -f -- "$tmp/patches"
+    rmdir "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! git patch-id --stable < "$tmp/patches" > "$tmp/patch-ids" 2>/dev/null; then
+    rm -f -- "$tmp/patches" "$tmp/patch-ids"
+    rmdir "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! awk 'NF { print $1 }' "$tmp/patch-ids" > "$tmp/ids"; then
+    rm -f -- "$tmp/patches" "$tmp/patch-ids" "$tmp/ids"
+    rmdir "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  sort -u "$tmp/ids"
+  status=$?
+  rm -f -- "$tmp/patches" "$tmp/patch-ids" "$tmp/ids"
+  rmdir "$tmp" 2>/dev/null || true
+  return "$status"
+}
+
+patch_applies_to_tree() {
+  local patch=$1 tree=$2 direction=$3 tmp status
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-patch-apply.XXXXXX") || return 2
+  if ! GIT_INDEX_FILE="$tmp/index" git -C "$WT" read-tree "$tree" 2>/dev/null; then
+    rm -f -- "$tmp/index"
+    rmdir "$tmp" 2>/dev/null || true
+    return 2
+  fi
+  if [ "$direction" = reverse ]; then
+    GIT_INDEX_FILE="$tmp/index" git -C "$WT" apply --cached --check --unidiff-zero -p0 --reverse "$patch" >/dev/null 2>&1
+  else
+    GIT_INDEX_FILE="$tmp/index" git -C "$WT" apply --cached --check --unidiff-zero -p0 "$patch" >/dev/null 2>&1
+  fi
+  status=$?
+  rm -f -- "$tmp/index"
+  rmdir "$tmp" 2>/dev/null || true
+  case "$status" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+patch_was_reversed_by_reference_commits() {
+  local subject=$1 reference_commits=$2 tmp parents candidate parent status
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-reverse-scan.XXXXXX") || return 2
+  if ! git -C "$WT" show --format= --binary --full-index --no-ext-diff --no-prefix "$subject" > "$tmp/patch" 2>/dev/null; then
+    rm -f -- "$tmp/patch"
+    rmdir "$tmp" 2>/dev/null || true
+    return 2
+  fi
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    parents=$(git -C "$WT" rev-list --parents -n 1 "$candidate" 2>/dev/null) || {
+      rm -f -- "$tmp/patch"
+      rmdir "$tmp" 2>/dev/null || true
+      return 2
+    }
+    parents=${parents#* }
+    [ "$parents" != "$candidate" ] || continue
+    for parent in $parents; do
+      patch_applies_to_tree "$tmp/patch" "$parent" reverse
+      status=$?
+      case "$status" in
+        0) ;;
+        1) continue ;;
+        *)
+          rm -f -- "$tmp/patch"
+          rmdir "$tmp" 2>/dev/null || true
+          return 2
+          ;;
+      esac
+      patch_applies_to_tree "$tmp/patch" "$candidate" forward
+      status=$?
+      case "$status" in
+        0)
+          rm -f -- "$tmp/patch"
+          rmdir "$tmp" 2>/dev/null || true
+          return 0
+          ;;
+        1) ;;
+        *)
+          rm -f -- "$tmp/patch"
+          rmdir "$tmp" 2>/dev/null || true
+          return 2
+          ;;
+      esac
+    done
+  done <<EOF
+$reference_commits
+EOF
+  rm -f -- "$tmp/patch"
+  rmdir "$tmp" 2>/dev/null || true
+  return 1
 }
 
 # The one patch-set comparison behind every landed-work patch check, so a future
@@ -1085,7 +1193,7 @@ patch_ids_for_log() {
 # commit that did touch them.
 subject_patches_are_in_reference() {
   local -a ref_args=() subject_args=() pathspecs=()
-  local past_separator=0 arg ref_ids reverted_ids subject_commits subject_paths commit patch_id path
+  local past_separator=0 arg ref_ids reverted_ids reference_commits subject_commits subject_paths commit patch_id path status
   for arg in "$@"; do
     if [ "$past_separator" = 0 ] && [ "$arg" = '::' ]; then
       past_separator=1
@@ -1100,11 +1208,7 @@ subject_patches_are_in_reference() {
   [ "${#ref_args[@]}" -gt 0 ] && [ "${#subject_args[@]}" -gt 0 ] || return 1
   subject_commits=$(git -C "$WT" log --format=%H "${subject_args[@]}" -- 2>/dev/null) || return 1
   [ -n "$subject_commits" ] || return 2
-  subject_paths=$(
-    git -C "$WT" -c core.quotePath=false log --format= --name-only "${subject_args[@]}" -- 2>/dev/null \
-      | sed '/^$/d' \
-      | sort -u
-  ) || return 1
+  subject_paths=$(git -C "$WT" -c core.quotePath=false log --format= --name-only --no-renames "${subject_args[@]}" -- 2>/dev/null) || return 1
   [ -n "$subject_paths" ] || return 1
   while IFS= read -r path; do
     [ -n "$path" ] || continue
@@ -1116,6 +1220,7 @@ EOF
   ref_ids=$(patch_ids_for_log --full-history "${ref_args[@]}" -- "${pathspecs[@]}") || return 1
   [ -n "$ref_ids" ] || return 1
   reverted_ids=$(patch_ids_for_log --full-history -R "${ref_args[@]}" -- "${pathspecs[@]}") || return 1
+  reference_commits=$(git -C "$WT" log --format=%H --full-history "${ref_args[@]}" -- "${pathspecs[@]}" 2>/dev/null) || return 1
   while IFS= read -r commit; do
     [ -n "$commit" ] || continue
     patch_id=$(patch_id_for_commit "$commit") || return 1
@@ -1124,6 +1229,9 @@ EOF
     if [ -n "$reverted_ids" ] && printf '%s\n' "$reverted_ids" | grep -qxF "$patch_id"; then
       return 1
     fi
+    patch_was_reversed_by_reference_commits "$commit" "$reference_commits"
+    status=$?
+    [ "$status" -eq 1 ] || return 1
   done <<EOF
 $subject_commits
 EOF
