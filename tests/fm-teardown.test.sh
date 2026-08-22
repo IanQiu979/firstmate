@@ -55,8 +55,9 @@
 #   (q2g) local-only + one same-file hunk reverted               -> REFUSE (safety)
 #   (q2h) local-only + one added line reverted                   -> REFUSE (safety)
 #   (q2i) local-only + one added line replaced                   -> REFUSE (safety)
+#   (q2j) local-only + added file fully replaced                 -> REFUSE (safety)
 #   (q3) local-only + every patch landed but worktree dirty     -> REFUSE (dirty wins)
-#   (q4) no-mistakes + patch landed, main edited it afterwards  -> ALLOW  (rebase fix)
+#   (q4) no-mistakes + patch landed, all its content replaced   -> REFUSE (safety)
 #   (q5) local-only + rewritten rename patch landed              -> ALLOW  (rename fix)
 #   (q6) patch-history read fails after emitting output          -> REFUSE (fail-safe)
 #
@@ -1095,6 +1096,45 @@ SH
   pass "local-only worktree whose added line was replaced is refused"
 }
 
+test_local_only_rebased_added_file_fully_replaced_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-added-file-replaced)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' A B > "$case_dir/wt/feature.txt"
+  git -C "$case_dir/wt" add -- feature.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "add two-line feature"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' A B > "$case_dir/project/feature.txt"
+  git -C "$case_dir/project" add -- feature.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten two-line feature"
+  printf '%s\n' C D > "$case_dir/project/feature.txt"
+  git -C "$case_dir/project" add -- feature.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "replace entire feature"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-added-file-replaced: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-added-file-replaced: no REFUSED line in stderr"
+  [ ! -e "$case_dir/treehouse-called" ] || fail "rebased-added-file-replaced: destructive return was invoked"
+  grep -Fxq A "$case_dir/wt/feature.txt" || fail "rebased-added-file-replaced: worktree content was discarded"
+  grep -Fxq B "$case_dir/wt/feature.txt" || fail "rebased-added-file-replaced: worktree content was discarded"
+  pass "local-only worktree whose added file was fully replaced is refused"
+}
+
 test_local_only_rewritten_rename_patch_landed_allows() {
   local case_dir rc
   case_dir=$(make_case rewritten-rename)
@@ -1172,24 +1212,30 @@ test_local_only_rebased_patch_landed_but_dirty_refuses() {
   pass "worktree with uncommitted changes is refused even when every commit's patch landed"
 }
 
-test_no_mistakes_rebased_patch_landed_after_later_edit_allows() {
+test_no_mistakes_rebased_patch_landed_after_full_replacement_refuses() {
   local case_dir rc
   case_dir=$(make_case nm-rebased-landed)
   write_meta "$case_dir" no-mistakes ship
   wt_commit_file "$case_dir" feature.txt hello "add feature"
-  # The patch landed on origin/main under a rewritten commit, then main edited the
-  # same file again. The whole-tree content check cannot conclude anything from
-  # that, so only patch equivalence proves the branch's work is already in.
   land_rewritten_patch_then_edit_on_origin_main "$case_dir" feature.txt hello revised
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
 
   set +e
   run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
 
-  expect_code 0 "$rc" "nm-rebased-landed: teardown should succeed when the patch landed under a rewritten commit"
-  ! grep -q REFUSED "$case_dir/stderr" || fail "nm-rebased-landed: teardown printed a REFUSED line"
-  pass "no-mistakes worktree whose patch landed under a rewritten commit is torn down"
+  expect_code 1 "$rc" "nm-rebased-landed: teardown should refuse when all subject content was replaced"
+  grep -q REFUSED "$case_dir/stderr" || fail "nm-rebased-landed: no REFUSED line in stderr"
+  [ ! -e "$case_dir/treehouse-called" ] || fail "nm-rebased-landed: destructive return was invoked"
+  grep -Fxq hello "$case_dir/wt/feature.txt" || fail "nm-rebased-landed: worktree content was discarded"
+  pass "no-mistakes worktree whose landed content was fully replaced is refused"
 }
 
 test_no_mistakes_origin_remote_allows() {
@@ -3145,8 +3191,9 @@ test_local_only_rebased_patch_reverted_then_relanded_allows
 test_local_only_rebased_same_file_hunk_partially_reverted_refuses
 test_local_only_rebased_added_line_partially_reverted_refuses
 test_local_only_rebased_added_line_replaced_refuses
+test_local_only_rebased_added_file_fully_replaced_refuses
 test_local_only_rebased_patch_landed_but_dirty_refuses
-test_no_mistakes_rebased_patch_landed_after_later_edit_allows
+test_no_mistakes_rebased_patch_landed_after_full_replacement_refuses
 test_local_only_rewritten_rename_patch_landed_allows
 test_patch_log_failure_after_output_refuses
 test_no_mistakes_origin_remote_allows

@@ -1098,13 +1098,14 @@ patch_ids_for_log() {
 }
 
 changes_are_represented_in_tree() {
-  local pre=$1 post=$2 tree=$3 paths path tmp pre_entry post_entry current_entry
-  local pre_meta post_meta current_meta pre_mode post_mode current_mode pre_oid post_oid current_oid
-  local numstat current_numstat status added_file
-  paths=$(git -C "$WT" -c core.quotePath=false diff --name-only --no-renames "$pre" "$post" -- 2>/dev/null) || return 1
-  [ -n "$paths" ] || return 1
+  local pre=$1 post=$2 tree=$3 tmp status
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-current-tree.XXXXXX") || return 1
   if ! git -C "$WT" diff --binary --full-index --no-ext-diff --no-prefix --no-renames "$pre" "$post" -- > "$tmp/aggregate.patch" 2>/dev/null; then
+    rm -f -- "$tmp/aggregate.patch"
+    rmdir "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if [ ! -s "$tmp/aggregate.patch" ]; then
     rm -f -- "$tmp/aggregate.patch"
     rmdir "$tmp" 2>/dev/null || true
     return 1
@@ -1117,139 +1118,8 @@ changes_are_represented_in_tree() {
   GIT_INDEX_FILE="$tmp/index" git -C "$WT" apply --cached --check --reverse -p0 "$tmp/aggregate.patch" >/dev/null 2>&1
   status=$?
   rm -f -- "$tmp/aggregate.patch" "$tmp/index" "$tmp/index.lock"
-  if [ "$status" -eq 0 ]; then
-    rmdir "$tmp" 2>/dev/null || true
-    return 0
-  fi
-  while IFS= read -r path; do
-    [ -n "$path" ] || continue
-    pre_entry=$(git -C "$WT" -c core.quotePath=false ls-tree "$pre" -- ":(literal)$path" 2>/dev/null) || {
-      rmdir "$tmp" 2>/dev/null || true
-      return 1
-    }
-    post_entry=$(git -C "$WT" -c core.quotePath=false ls-tree "$post" -- ":(literal)$path" 2>/dev/null) || {
-      rmdir "$tmp" 2>/dev/null || true
-      return 1
-    }
-    current_entry=$(git -C "$WT" -c core.quotePath=false ls-tree "$tree" -- ":(literal)$path" 2>/dev/null) || {
-      rmdir "$tmp" 2>/dev/null || true
-      return 1
-    }
-    if [ -z "$post_entry" ]; then
-      [ -z "$current_entry" ] || {
-        rmdir "$tmp" 2>/dev/null || true
-        return 1
-      }
-      continue
-    fi
-    [ -n "$current_entry" ] || {
-      rmdir "$tmp" 2>/dev/null || true
-      return 1
-    }
-    pre_meta=${pre_entry%%$'\t'*}
-    post_meta=${post_entry%%$'\t'*}
-    current_meta=${current_entry%%$'\t'*}
-    read -r pre_mode _ pre_oid <<EOF
-$pre_meta
-EOF
-    read -r post_mode _ post_oid <<EOF
-$post_meta
-EOF
-    read -r current_mode _ current_oid <<EOF
-$current_meta
-EOF
-    [ -n "$post_oid" ] && [ -n "$current_oid" ] && [ "$post_mode" = "$current_mode" ] || {
-      rmdir "$tmp" 2>/dev/null || true
-      return 1
-    }
-    [ "$post_oid" != "$current_oid" ] || continue
-    numstat=$(git -C "$WT" diff --numstat --no-renames "$pre" "$post" -- ":(literal)$path" 2>/dev/null) || {
-      rmdir "$tmp" 2>/dev/null || true
-      return 1
-    }
-    case "$numstat" in
-      -$'\t'-$'\t'*)
-        rmdir "$tmp" 2>/dev/null || true
-        return 1
-        ;;
-    esac
-    added_file=0
-    if [ -n "$pre_oid" ]; then
-      if ! git -C "$WT" cat-file blob "$pre_oid" > "$tmp/pre" 2>/dev/null; then
-        rm -f -- "$tmp/pre"
-        rmdir "$tmp" 2>/dev/null || true
-        return 1
-      fi
-    else
-      added_file=1
-      : > "$tmp/pre"
-    fi
-    if ! git -C "$WT" cat-file blob "$post_oid" > "$tmp/post" 2>/dev/null; then
-      rm -f -- "$tmp/pre" "$tmp/post"
-      rmdir "$tmp" 2>/dev/null || true
-      return 1
-    fi
-    if ! git -C "$WT" cat-file blob "$current_oid" > "$tmp/current" 2>/dev/null; then
-      rm -f -- "$tmp/pre" "$tmp/post" "$tmp/current"
-      rmdir "$tmp" 2>/dev/null || true
-      return 1
-    fi
-    git -C "$WT" diff --no-index --numstat --no-ext-diff "$tmp/post" "$tmp/current" > "$tmp/current.numstat" 2>/dev/null
-    status=$?
-    [ "$status" -le 1 ] || {
-      rm -f -- "$tmp/pre" "$tmp/post" "$tmp/current" "$tmp/current.numstat"
-      rmdir "$tmp" 2>/dev/null || true
-      return 1
-    }
-    current_numstat=$(cat "$tmp/current.numstat") || {
-      rm -f -- "$tmp/pre" "$tmp/post" "$tmp/current" "$tmp/current.numstat"
-      rmdir "$tmp" 2>/dev/null || true
-      return 1
-    }
-    case "$current_numstat" in
-      -$'\t'-$'\t'*)
-        rm -f -- "$tmp/pre" "$tmp/post" "$tmp/current" "$tmp/current.numstat"
-        rmdir "$tmp" 2>/dev/null || true
-        return 1
-        ;;
-    esac
-    if ! awk -v added_file="$added_file" '
-      FILENAME == ARGV[1] { before[$0]++; next }
-      FILENAME == ARGV[2] { after[$0]++; next }
-      FILENAME == ARGV[3] { current[$0]++; current_lines++; next }
-      END {
-        for (line in before) {
-          if (before[line] > after[line] && current[line] > after[line]) bad = 1
-          if (before[line] != current[line]) changed = 1
-        }
-        for (line in after) {
-          added = after[line] - before[line]
-          if (added > 0) {
-            present = current[line] - before[line]
-            if (present < 0) present = 0
-            if (present > added) present = added
-            retained += present
-          }
-          if (after[line] != current[line]) changed = 1
-        }
-        for (line in current) {
-          if (current[line] != after[line]) changed = 1
-        }
-        if (!changed || bad) exit 1
-        if (added_file && retained == 0 && current_lines > 0) exit 0
-        exit 1
-      }
-    ' "$tmp/pre" "$tmp/post" "$tmp/current"; then
-      rm -f -- "$tmp/pre" "$tmp/post" "$tmp/current" "$tmp/current.numstat"
-      rmdir "$tmp" 2>/dev/null || true
-      return 1
-    fi
-    rm -f -- "$tmp/pre" "$tmp/post" "$tmp/current" "$tmp/current.numstat"
-  done <<EOF
-$paths
-EOF
   rmdir "$tmp" 2>/dev/null || true
-  return 0
+  [ "$status" -eq 0 ]
 }
 
 # The one patch-set comparison behind every landed-work patch check, so a future
