@@ -50,6 +50,8 @@
 #   (q2b) local-only + landed patch reverted on main again      -> REFUSE (safety)
 #   (q2c) local-only + combined revert on main                   -> REFUSE (safety)
 #   (q2d) local-only + two landed patches jointly reverted      -> REFUSE (safety)
+#   (q2e) local-only + one file of landed patch reverted         -> REFUSE (safety)
+#   (q2f) local-only + reverted patch re-landed                  -> ALLOW  (current state)
 #   (q3) local-only + every patch landed but worktree dirty     -> REFUSE (dirty wins)
 #   (q4) no-mistakes + patch landed, main edited it afterwards  -> ALLOW  (rebase fix)
 #   (q5) local-only + rewritten rename patch landed              -> ALLOW  (rename fix)
@@ -889,6 +891,83 @@ SH
   [ ! -e "$case_dir/treehouse-called" ] || fail "rebased-sequence-reverted: destructive return was invoked"
   [ -e "$case_dir/wt/shared.txt" ] || fail "rebased-sequence-reverted: worktree work was discarded"
   pass "local-only worktree whose landed patch sequence was jointly reverted is refused"
+}
+
+test_local_only_rebased_multifile_patch_partially_reverted_on_main_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-partial-revert)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' one > "$case_dir/wt/one.txt"
+  printf '%s\n' two > "$case_dir/wt/two.txt"
+  git -C "$case_dir/wt" add -- one.txt two.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "add both files"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' one > "$case_dir/project/one.txt"
+  printf '%s\n' two > "$case_dir/project/two.txt"
+  git -C "$case_dir/project" add -- one.txt two.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten add both files"
+  git -C "$case_dir/project" rm -q -- two.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "revert one file"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-partial-revert: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-partial-revert: no REFUSED line in stderr"
+  [ ! -e "$case_dir/treehouse-called" ] || fail "rebased-partial-revert: destructive return was invoked"
+  [ -e "$case_dir/wt/two.txt" ] || fail "rebased-partial-revert: worktree work was discarded"
+  pass "local-only worktree whose multi-file patch was partially reverted is refused"
+}
+
+test_local_only_rebased_patch_reverted_then_relanded_allows() {
+  local case_dir rc
+  case_dir=$(make_case rebased-relanded)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' x > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "add baseline"
+  git -C "$case_dir/wt" rebase main >/dev/null
+  printf '%s\n' y > "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change x to y"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' y > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten landing"
+  printf '%s\n' x > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "revert landing"
+  printf '%s\n' y > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "re-land change"
+  git -C "$case_dir/wt" merge-base --is-ancestor HEAD main 2>/dev/null \
+    && fail "rebased-relanded: branch commit is still reachable from main"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "rebased-relanded: teardown should accept the final landed state"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "rebased-relanded: teardown printed a REFUSED line"
+  pass "local-only worktree whose reverted patch was re-landed is torn down"
 }
 
 test_local_only_rewritten_rename_patch_landed_allows() {
@@ -2936,6 +3015,8 @@ test_local_only_rebased_patch_with_absent_commit_refuses
 test_local_only_rebased_patch_reverted_on_main_refuses
 test_local_only_rebased_patch_combined_revert_on_main_refuses
 test_local_only_rebased_patch_sequence_jointly_reverted_on_main_refuses
+test_local_only_rebased_multifile_patch_partially_reverted_on_main_refuses
+test_local_only_rebased_patch_reverted_then_relanded_allows
 test_local_only_rebased_patch_landed_but_dirty_refuses
 test_no_mistakes_rebased_patch_landed_after_later_edit_allows
 test_local_only_rewritten_rename_patch_landed_allows

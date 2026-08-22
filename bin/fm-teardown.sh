@@ -1042,10 +1042,8 @@ ensure_commit_object() {
   git -C "$WT" cat-file -e "$commit^{commit}" 2>/dev/null
 }
 
-# --no-prefix everywhere a patch id is taken: the default a/ and b/ prefixes swap
-# places under `-R`, so a patch and its own reverse would otherwise hash to
-# different ids and the revert check below could never match. It only has to be
-# consistent, since every id compared here is computed in the same repository.
+# --no-prefix only has to be consistent, since every id compared here is
+# computed in the same repository.
 patch_id_for_commit() {
   local commit=$1 tmp patch_output status
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-patch-id.XXXXXX") || return 1
@@ -1122,99 +1120,57 @@ patch_applies_to_tree() {
   esac
 }
 
-patch_file_was_reversed_by_reference_commits() {
-  local patch=$1 reference_commits=$2 parents candidate parent status
-  while IFS= read -r candidate; do
-    [ -n "$candidate" ] || continue
-    parents=$(git -C "$WT" rev-list --parents -n 1 "$candidate" 2>/dev/null) || {
-      return 2
+commit_paths_are_represented_in_tree() {
+  local commit=$1 tree=$2 paths path tmp status
+  paths=$(git -C "$WT" -c core.quotePath=false show --format= --name-only --no-renames "$commit" -- 2>/dev/null) || return 1
+  [ -n "$paths" ] || return 1
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-current-tree.XXXXXX") || return 1
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    if ! git -C "$WT" show --format= --binary --full-index --no-ext-diff --no-prefix --no-renames "$commit" -- ":(literal)$path" > "$tmp/patch" 2>/dev/null; then
+      rm -f -- "$tmp/patch"
+      rmdir "$tmp" 2>/dev/null || true
+      return 1
+    fi
+    [ -s "$tmp/patch" ] || {
+      rm -f -- "$tmp/patch"
+      rmdir "$tmp" 2>/dev/null || true
+      return 1
     }
-    parents=${parents#* }
-    [ "$parents" != "$candidate" ] || continue
-    for parent in $parents; do
-      patch_applies_to_tree "$patch" "$parent" reverse
-      status=$?
-      case "$status" in
-        0) ;;
-        1) continue ;;
-        *) return 2 ;;
-      esac
-      patch_applies_to_tree "$patch" "$candidate" forward
-      status=$?
-      case "$status" in
-        0) return 0 ;;
-        1) ;;
-        *) return 2 ;;
-      esac
-    done
+    patch_applies_to_tree "$tmp/patch" "$tree" forward
+    status=$?
+    case "$status" in
+      0)
+        rm -f -- "$tmp/patch"
+        rmdir "$tmp" 2>/dev/null || true
+        return 1
+        ;;
+      1) ;;
+      *)
+        rm -f -- "$tmp/patch"
+        rmdir "$tmp" 2>/dev/null || true
+        return 1
+        ;;
+    esac
   done <<EOF
-$reference_commits
+$paths
 EOF
-  return 1
-}
-
-patch_was_reversed_by_reference_commits() {
-  local subject=$1 reference_commits=$2 tmp status
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-reverse-scan.XXXXXX") || return 2
-  if ! git -C "$WT" show --format= --binary --full-index --no-ext-diff --no-prefix "$subject" > "$tmp/patch" 2>/dev/null; then
-    rm -f -- "$tmp/patch"
-    rmdir "$tmp" 2>/dev/null || true
-    return 2
-  fi
-  patch_file_was_reversed_by_reference_commits "$tmp/patch" "$reference_commits"
-  status=$?
   rm -f -- "$tmp/patch"
   rmdir "$tmp" 2>/dev/null || true
-  return "$status"
-}
-
-subject_sequence_was_reversed_by_reference_commits() {
-  local subject_commits=$1 reference_commits=$2 newest= oldest= commit base tmp status count=0
-  while IFS= read -r commit; do
-    [ -n "$commit" ] || continue
-    [ -n "$newest" ] || newest=$commit
-    oldest=$commit
-    count=$((count + 1))
-  done <<EOF
-$subject_commits
-EOF
-  [ "$count" -gt 1 ] || return 1
-  while IFS= read -r commit; do
-    [ -n "$commit" ] || continue
-    git -C "$WT" merge-base --is-ancestor "$commit" "$newest" 2>/dev/null || return 2
-  done <<EOF
-$subject_commits
-EOF
-  base=$(git -C "$WT" rev-parse --verify "$oldest^" 2>/dev/null) || return 2
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-sequence-scan.XXXXXX") || return 2
-  if ! git -C "$WT" diff --binary --full-index --no-ext-diff --no-prefix "$base" "$newest" -- > "$tmp/patch" 2>/dev/null; then
-    rm -f -- "$tmp/patch"
-    rmdir "$tmp" 2>/dev/null || true
-    return 2
-  fi
-  [ -s "$tmp/patch" ] || {
-    rm -f -- "$tmp/patch"
-    rmdir "$tmp" 2>/dev/null || true
-    return 2
-  }
-  patch_file_was_reversed_by_reference_commits "$tmp/patch" "$reference_commits"
-  status=$?
-  rm -f -- "$tmp/patch"
-  rmdir "$tmp" 2>/dev/null || true
-  return "$status"
+  return 0
 }
 
 # The one patch-set comparison behind every landed-work patch check, so a future
 # fix to it can never land on only one copy. Takes the reference-side `git log`
 # arguments, the literal separator `::`, then the subject-side ones. Returns 0
-# when EVERY subject commit's patch is already present on the reference side and
-# none of them is undone there again, 2 when the subject side is empty so there is
-# nothing to prove (the caller decides what that means), and 1 for everything
+# when EVERY subject commit's patch appeared on the reference side and every
+# changed path remains represented in its current tree, 2 when the subject side
+# is empty so there is nothing to prove (the caller decides what that means), and
+# 1 for everything
 # else: an unreadable git log, a subject side that touches no path, a reference
 # side that contributes no patch ids at all, an empty or unreadable subject patch
-# id, any subject commit whose patch is missing, or any subject patch the
-# reference side also carries in REVERSE (the landed-then-reverted case, where the
-# work is no longer present and discarding it would lose it).
+# id, any subject commit whose patch is missing, or any subject path whose change
+# is no longer represented in the current reference tree.
 # The reference scan is bounded to the paths the subject commits touch: a commit
 # can only carry a subject commit's patch if it touches exactly those paths, so
 # this can never drop a match, and it keeps unrelated default-branch history out
@@ -1222,7 +1178,9 @@ EOF
 # commit that did touch them.
 subject_patches_are_in_reference() {
   local -a ref_args=() subject_args=() pathspecs=()
-  local past_separator=0 arg ref_ids reverted_ids reference_commits subject_commits subject_paths commit patch_id path status
+  local reference_tree=$1 past_separator=0 arg ref_ids subject_commits subject_paths commit patch_id path
+  shift
+  git -C "$WT" rev-parse --verify "$reference_tree^{tree}" >/dev/null 2>&1 || return 1
   for arg in "$@"; do
     if [ "$past_separator" = 0 ] && [ "$arg" = '::' ]; then
       past_separator=1
@@ -1248,32 +1206,22 @@ EOF
   [ "${#pathspecs[@]}" -gt 0 ] || return 1
   ref_ids=$(patch_ids_for_log --full-history "${ref_args[@]}" -- "${pathspecs[@]}") || return 1
   [ -n "$ref_ids" ] || return 1
-  reverted_ids=$(patch_ids_for_log --full-history -R "${ref_args[@]}" -- "${pathspecs[@]}") || return 1
-  reference_commits=$(git -C "$WT" log --format=%H --full-history "${ref_args[@]}" -- "${pathspecs[@]}" 2>/dev/null) || return 1
   while IFS= read -r commit; do
     [ -n "$commit" ] || continue
     patch_id=$(patch_id_for_commit "$commit") || return 1
     [ -n "$patch_id" ] || return 1
     printf '%s\n' "$ref_ids" | grep -qxF "$patch_id" || return 1
-    if [ -n "$reverted_ids" ] && printf '%s\n' "$reverted_ids" | grep -qxF "$patch_id"; then
-      return 1
-    fi
-    patch_was_reversed_by_reference_commits "$commit" "$reference_commits"
-    status=$?
-    [ "$status" -eq 1 ] || return 1
+    commit_paths_are_represented_in_tree "$commit" "$reference_tree" || return 1
   done <<EOF
 $subject_commits
 EOF
-  subject_sequence_was_reversed_by_reference_commits "$subject_commits" "$reference_commits"
-  status=$?
-  [ "$status" -eq 1 ] || return 1
 }
 
 unpushed_patches_are_in_pr_head() {
   local pr_head=$1 current base
   current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
   base=$(git -C "$WT" merge-base "$current" "$pr_head" 2>/dev/null) || return 1
-  subject_patches_are_in_reference "$base..$pr_head" :: HEAD --not --remotes
+  subject_patches_are_in_reference "$pr_head" "$base..$pr_head" :: HEAD --not --remotes
 }
 
 # Is the worktree's PR merged for local work contained in that PR? Resolves the
@@ -1353,7 +1301,7 @@ content_in_ref() {
 patches_are_in_ref() {
   local ref=$1 status
   [ -n "$ref" ] || return 1
-  subject_patches_are_in_reference "$ref" --not HEAD :: HEAD --not "$ref"
+  subject_patches_are_in_reference "$ref" "$ref" --not HEAD :: HEAD --not "$ref"
   status=$?
   [ "$status" -eq 0 ] || [ "$status" -eq 2 ]
 }
