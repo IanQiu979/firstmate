@@ -54,6 +54,7 @@
 #   (q2f) local-only + reverted patch re-landed                  -> ALLOW  (current state)
 #   (q2g) local-only + one same-file hunk reverted               -> REFUSE (safety)
 #   (q2h) local-only + one added line reverted                   -> REFUSE (safety)
+#   (q2i) local-only + one added line replaced                   -> REFUSE (safety)
 #   (q3) local-only + every patch landed but worktree dirty     -> REFUSE (dirty wins)
 #   (q4) no-mistakes + patch landed, main edited it afterwards  -> ALLOW  (rebase fix)
 #   (q5) local-only + rewritten rename patch landed              -> ALLOW  (rename fix)
@@ -1054,6 +1055,44 @@ SH
   [ ! -e "$case_dir/treehouse-called" ] || fail "rebased-added-line-revert: destructive return was invoked"
   grep -Fxq B "$case_dir/wt/feature.txt" || fail "rebased-added-line-revert: worktree line was discarded"
   pass "local-only worktree whose added line was reverted is refused"
+}
+
+test_local_only_rebased_added_line_replaced_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-added-line-replaced)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' A B > "$case_dir/wt/feature.txt"
+  git -C "$case_dir/wt" add -- feature.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "add two-line feature"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' A B > "$case_dir/project/feature.txt"
+  git -C "$case_dir/project" add -- feature.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten two-line feature"
+  printf '%s\n' A C > "$case_dir/project/feature.txt"
+  git -C "$case_dir/project" add -- feature.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "replace added line"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-added-line-replaced: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-added-line-replaced: no REFUSED line in stderr"
+  [ ! -e "$case_dir/treehouse-called" ] || fail "rebased-added-line-replaced: destructive return was invoked"
+  grep -Fxq B "$case_dir/wt/feature.txt" || fail "rebased-added-line-replaced: worktree line was discarded"
+  pass "local-only worktree whose added line was replaced is refused"
 }
 
 test_local_only_rewritten_rename_patch_landed_allows() {
@@ -3105,6 +3144,7 @@ test_local_only_rebased_multifile_patch_partially_reverted_on_main_refuses
 test_local_only_rebased_patch_reverted_then_relanded_allows
 test_local_only_rebased_same_file_hunk_partially_reverted_refuses
 test_local_only_rebased_added_line_partially_reverted_refuses
+test_local_only_rebased_added_line_replaced_refuses
 test_local_only_rebased_patch_landed_but_dirty_refuses
 test_no_mistakes_rebased_patch_landed_after_later_edit_allows
 test_local_only_rewritten_rename_patch_landed_allows

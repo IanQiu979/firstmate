@@ -1097,21 +1097,37 @@ patch_ids_for_log() {
   return "$status"
 }
 
-commit_paths_are_represented_in_tree() {
-  local commit=$1 tree=$2 paths path tmp parent pre_entry post_entry current_entry
+changes_are_represented_in_tree() {
+  local pre=$1 post=$2 tree=$3 paths path tmp pre_entry post_entry current_entry
   local pre_meta post_meta current_meta pre_mode post_mode current_mode pre_oid post_oid current_oid
-  local numstat status
-  paths=$(git -C "$WT" -c core.quotePath=false show --format= --name-only --no-renames "$commit" -- 2>/dev/null) || return 1
+  local numstat current_numstat status added_file
+  paths=$(git -C "$WT" -c core.quotePath=false diff --name-only --no-renames "$pre" "$post" -- 2>/dev/null) || return 1
   [ -n "$paths" ] || return 1
-  parent=$(git -C "$WT" rev-parse --verify "$commit^" 2>/dev/null) || return 1
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-current-tree.XXXXXX") || return 1
+  if ! git -C "$WT" diff --binary --full-index --no-ext-diff --no-prefix --no-renames "$pre" "$post" -- > "$tmp/aggregate.patch" 2>/dev/null; then
+    rm -f -- "$tmp/aggregate.patch"
+    rmdir "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! GIT_INDEX_FILE="$tmp/index" git -C "$WT" read-tree "$tree" 2>/dev/null; then
+    rm -f -- "$tmp/aggregate.patch" "$tmp/index" "$tmp/index.lock"
+    rmdir "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  GIT_INDEX_FILE="$tmp/index" git -C "$WT" apply --cached --check --reverse -p0 "$tmp/aggregate.patch" >/dev/null 2>&1
+  status=$?
+  rm -f -- "$tmp/aggregate.patch" "$tmp/index" "$tmp/index.lock"
+  if [ "$status" -eq 0 ]; then
+    rmdir "$tmp" 2>/dev/null || true
+    return 0
+  fi
   while IFS= read -r path; do
     [ -n "$path" ] || continue
-    pre_entry=$(git -C "$WT" -c core.quotePath=false ls-tree "$parent" -- ":(literal)$path" 2>/dev/null) || {
+    pre_entry=$(git -C "$WT" -c core.quotePath=false ls-tree "$pre" -- ":(literal)$path" 2>/dev/null) || {
       rmdir "$tmp" 2>/dev/null || true
       return 1
     }
-    post_entry=$(git -C "$WT" -c core.quotePath=false ls-tree "$commit" -- ":(literal)$path" 2>/dev/null) || {
+    post_entry=$(git -C "$WT" -c core.quotePath=false ls-tree "$post" -- ":(literal)$path" 2>/dev/null) || {
       rmdir "$tmp" 2>/dev/null || true
       return 1
     }
@@ -1147,7 +1163,7 @@ EOF
       return 1
     }
     [ "$post_oid" != "$current_oid" ] || continue
-    numstat=$(git -C "$WT" diff --numstat --no-renames "$parent" "$commit" -- ":(literal)$path" 2>/dev/null) || {
+    numstat=$(git -C "$WT" diff --numstat --no-renames "$pre" "$post" -- ":(literal)$path" 2>/dev/null) || {
       rmdir "$tmp" 2>/dev/null || true
       return 1
     }
@@ -1157,52 +1173,78 @@ EOF
         return 1
         ;;
     esac
-    if ! git -C "$WT" diff --unified=0 --no-ext-diff --no-renames "$parent" "$commit" -- ":(literal)$path" > "$tmp/original.diff" 2>/dev/null; then
-      rm -f -- "$tmp/original.diff"
-      rmdir "$tmp" 2>/dev/null || true
-      return 1
+    added_file=0
+    if [ -n "$pre_oid" ]; then
+      if ! git -C "$WT" cat-file blob "$pre_oid" > "$tmp/pre" 2>/dev/null; then
+        rm -f -- "$tmp/pre"
+        rmdir "$tmp" 2>/dev/null || true
+        return 1
+      fi
+    else
+      added_file=1
+      : > "$tmp/pre"
     fi
     if ! git -C "$WT" cat-file blob "$post_oid" > "$tmp/post" 2>/dev/null; then
-      rm -f -- "$tmp/original.diff" "$tmp/post"
+      rm -f -- "$tmp/pre" "$tmp/post"
       rmdir "$tmp" 2>/dev/null || true
       return 1
     fi
     if ! git -C "$WT" cat-file blob "$current_oid" > "$tmp/current" 2>/dev/null; then
-      rm -f -- "$tmp/original.diff" "$tmp/post" "$tmp/current"
+      rm -f -- "$tmp/pre" "$tmp/post" "$tmp/current"
       rmdir "$tmp" 2>/dev/null || true
       return 1
     fi
-    git -C "$WT" diff --no-index --unified=0 --no-ext-diff --no-prefix "$tmp/post" "$tmp/current" > "$tmp/current.diff" 2>/dev/null
+    git -C "$WT" diff --no-index --numstat --no-ext-diff "$tmp/post" "$tmp/current" > "$tmp/current.numstat" 2>/dev/null
     status=$?
     [ "$status" -le 1 ] || {
-      rm -f -- "$tmp/original.diff" "$tmp/post" "$tmp/current" "$tmp/current.diff"
+      rm -f -- "$tmp/pre" "$tmp/post" "$tmp/current" "$tmp/current.numstat"
       rmdir "$tmp" 2>/dev/null || true
       return 1
     }
-    if ! awk '
-      FNR == NR {
-        if ($0 ~ /^-/ && $0 !~ /^--- /) original_removed[substr($0, 2)] = 1
-        next
+    current_numstat=$(cat "$tmp/current.numstat") || {
+      rm -f -- "$tmp/pre" "$tmp/post" "$tmp/current" "$tmp/current.numstat"
+      rmdir "$tmp" 2>/dev/null || true
+      return 1
+    }
+    case "$current_numstat" in
+      -$'\t'-$'\t'*)
+        rm -f -- "$tmp/pre" "$tmp/post" "$tmp/current" "$tmp/current.numstat"
+        rmdir "$tmp" 2>/dev/null || true
+        return 1
+        ;;
+    esac
+    if ! awk -v added_file="$added_file" '
+      FILENAME == ARGV[1] { before[$0]++; next }
+      FILENAME == ARGV[2] { after[$0]++; next }
+      FILENAME == ARGV[3] { current[$0]++; current_lines++; next }
+      END {
+        for (line in before) {
+          if (before[line] > after[line] && current[line] > after[line]) bad = 1
+          if (before[line] != current[line]) changed = 1
+        }
+        for (line in after) {
+          added = after[line] - before[line]
+          if (added > 0) {
+            present = current[line] - before[line]
+            if (present < 0) present = 0
+            if (present > added) present = added
+            retained += present
+          }
+          if (after[line] != current[line]) changed = 1
+        }
+        for (line in current) {
+          if (current[line] != after[line]) changed = 1
+        }
+        if (!changed || bad) exit 1
+        if (added_file && retained == 0 && current_lines > 0) exit 0
+        exit 1
       }
-      function finish_hunk() {
-        if (in_hunk && removed > added) bad = 1
-        removed = 0
-        added = 0
-      }
-      /^@@ / { finish_hunk(); in_hunk = 1; next }
-      in_hunk && /^-/ && $0 !~ /^--- / { removed++; next }
-      in_hunk && /^\+/ && $0 !~ /^\+\+\+ / {
-        added++
-        if (substr($0, 2) in original_removed) bad = 1
-        next
-      }
-      END { finish_hunk(); exit bad ? 1 : 0 }
-    ' "$tmp/original.diff" "$tmp/current.diff"; then
-      rm -f -- "$tmp/original.diff" "$tmp/post" "$tmp/current" "$tmp/current.diff"
+    ' "$tmp/pre" "$tmp/post" "$tmp/current"; then
+      rm -f -- "$tmp/pre" "$tmp/post" "$tmp/current" "$tmp/current.numstat"
       rmdir "$tmp" 2>/dev/null || true
       return 1
     fi
-    rm -f -- "$tmp/original.diff" "$tmp/post" "$tmp/current" "$tmp/current.diff"
+    rm -f -- "$tmp/pre" "$tmp/post" "$tmp/current" "$tmp/current.numstat"
   done <<EOF
 $paths
 EOF
@@ -1229,6 +1271,7 @@ EOF
 subject_patches_are_in_reference() {
   local -a ref_args=() subject_args=() pathspecs=()
   local reference_tree=$1 past_separator=0 arg ref_ids subject_commits subject_paths commit patch_id path
+  local subject_tip= subject_oldest= subject_base
   shift
   git -C "$WT" rev-parse --verify "$reference_tree^{tree}" >/dev/null 2>&1 || return 1
   for arg in "$@"; do
@@ -1258,13 +1301,17 @@ EOF
   [ -n "$ref_ids" ] || return 1
   while IFS= read -r commit; do
     [ -n "$commit" ] || continue
+    [ -n "$subject_tip" ] || subject_tip=$commit
+    subject_oldest=$commit
     patch_id=$(patch_id_for_commit "$commit") || return 1
     [ -n "$patch_id" ] || return 1
     printf '%s\n' "$ref_ids" | grep -qxF "$patch_id" || return 1
-    commit_paths_are_represented_in_tree "$commit" "$reference_tree" || return 1
   done <<EOF
 $subject_commits
 EOF
+  [ -n "$subject_tip" ] && [ -n "$subject_oldest" ] || return 1
+  subject_base=$(git -C "$WT" rev-parse --verify "$subject_oldest^" 2>/dev/null) || return 1
+  changes_are_represented_in_tree "$subject_base" "$subject_tip" "$reference_tree"
 }
 
 unpushed_patches_are_in_pr_head() {
