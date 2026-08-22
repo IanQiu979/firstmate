@@ -1100,7 +1100,7 @@ patch_ids_for_log() {
 changes_are_represented_in_tree() {
   local pre=$1 post=$2 tree=$3 paths path tmp status pre_entry post_entry current_entry
   local post_meta current_meta post_mode post_type post_oid current_mode current_type current_oid
-  local numstat current_numstat
+  local numstat current_numstat current_additions current_deletions current_path
   paths=$(git -C "$WT" -c core.quotePath=false diff --name-only --no-renames "$pre" "$post" -- 2>/dev/null) || return 1
   [ -n "$paths" ] || return 1
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-current-tree.XXXXXX") || return 1
@@ -1195,22 +1195,28 @@ EOF
         return 1
         ;;
     esac
-    if ! git -C "$WT" cat-file blob "$post_oid" > "$tmp/post" 2>/dev/null ||
-      ! git -C "$WT" cat-file blob "$current_oid" > "$tmp/current" 2>/dev/null; then
-      rm -f -- "$tmp/post" "$tmp/current" "$tmp/index" "$tmp/index.lock"
+    IFS=$'\t' read -r current_additions current_deletions current_path <<EOF
+$current_numstat
+EOF
+    case "$current_additions" in
+      ''|*[!0-9]*)
+        rm -f -- "$tmp/index" "$tmp/index.lock"
+        rmdir "$tmp" 2>/dev/null || true
+        return 1
+        ;;
+    esac
+    case "$current_deletions" in
+      ''|*[!0-9]*)
+        rm -f -- "$tmp/index" "$tmp/index.lock"
+        rmdir "$tmp" 2>/dev/null || true
+        return 1
+        ;;
+    esac
+    if [ "$current_deletions" -ne 0 ]; then
+      rm -f -- "$tmp/index" "$tmp/index.lock"
       rmdir "$tmp" 2>/dev/null || true
       return 1
     fi
-    if ! awk '
-      FILENAME == ARGV[1] { required[++required_count] = $0; next }
-      FILENAME == ARGV[2] && matched < required_count && $0 == required[matched + 1] { matched++ }
-      END { exit matched == required_count ? 0 : 1 }
-    ' "$tmp/post" "$tmp/current"; then
-      rm -f -- "$tmp/post" "$tmp/current" "$tmp/index" "$tmp/index.lock"
-      rmdir "$tmp" 2>/dev/null || true
-      return 1
-    fi
-    rm -f -- "$tmp/post" "$tmp/current"
   done <<EOF
 $paths
 EOF
