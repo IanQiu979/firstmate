@@ -1121,10 +1121,22 @@ changes_are_represented_in_tree() {
       rmdir "$tmp" 2>/dev/null || true
       return 1
     }
-    GIT_INDEX_FILE="$tmp/index" git -C "$WT" apply --cached --check --reverse -p0 "$tmp/path.patch" >/dev/null 2>&1
+    LC_ALL=C GIT_INDEX_FILE="$tmp/index" git -C "$WT" apply --cached --check --reverse --verbose -p0 \
+      "$tmp/path.patch" > /dev/null 2> "$tmp/apply-output"
     status=$?
     rm -f -- "$tmp/path.patch"
-    [ "$status" -ne 0 ] || continue
+    if [ "$status" -eq 0 ]; then
+      grep -Eq '^Hunk #[0-9]+ succeeded at ' "$tmp/apply-output"
+      status=$?
+      rm -f -- "$tmp/apply-output"
+      if [ "$status" -ne 1 ]; then
+        rm -f -- "$tmp/index" "$tmp/index.lock"
+        rmdir "$tmp" 2>/dev/null || true
+        return 1
+      fi
+      continue
+    fi
+    rm -f -- "$tmp/apply-output"
     pre_entry=$(git -C "$WT" -c core.quotePath=false ls-tree "$pre" -- ":(literal)$path" 2>/dev/null) || {
       rm -f -- "$tmp/index" "$tmp/index.lock"
       rmdir "$tmp" 2>/dev/null || true
@@ -1243,7 +1255,7 @@ EOF
 # commit that did touch them.
 subject_patches_are_in_reference() {
   local -a ref_args=() subject_args=() pathspecs=()
-  local reference_tree=$1 past_separator=0 arg ref_ids subject_commits subject_paths commit patch_id path
+  local reference_tree=$1 past_separator=0 arg ref_ids subject_commits subject_paths commit patch_id path status
   local subject_tip= subject_oldest= subject_base
   shift
   git -C "$WT" rev-parse --verify "$reference_tree^{tree}" >/dev/null 2>&1 || return 1
@@ -1284,6 +1296,10 @@ $subject_commits
 EOF
   [ -n "$subject_tip" ] && [ -n "$subject_oldest" ] || return 1
   subject_base=$(git -C "$WT" rev-parse --verify "$subject_oldest^" 2>/dev/null) || return 1
+  git -C "$WT" diff --quiet --no-ext-diff --no-renames "$subject_base" "$subject_tip" -- 2>/dev/null
+  status=$?
+  [ "$status" -ne 0 ] || return 0
+  [ "$status" -eq 1 ] || return 1
   changes_are_represented_in_tree "$subject_base" "$subject_tip" "$reference_tree"
 }
 

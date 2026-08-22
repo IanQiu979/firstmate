@@ -58,6 +58,8 @@
 #   (q2j) local-only + added file fully replaced                 -> REFUSE (safety)
 #   (q2k) local-only + unrelated line appended after landing     -> ALLOW  (superset)
 #   (q2l) local-only + landed trailing newline removed            -> REFUSE (safety)
+#   (q2m) local-only + landed change relocated elsewhere          -> REFUSE (safety)
+#   (q2n) local-only + rewritten inverse sequence is net zero     -> ALLOW  (current state)
 #   (q3) local-only + every patch landed but worktree dirty     -> REFUSE (dirty wins)
 #   (q4) no-mistakes + patch landed, all its content replaced   -> REFUSE (safety)
 #   (q5) local-only + rewritten rename patch landed              -> ALLOW  (rename fix)
@@ -974,6 +976,108 @@ test_local_only_rebased_patch_reverted_then_relanded_allows() {
   expect_code 0 "$rc" "rebased-relanded: teardown should accept the final landed state"
   ! grep -q REFUSED "$case_dir/stderr" || fail "rebased-relanded: teardown printed a REFUSED line"
   pass "local-only worktree whose reverted patch was re-landed is torn down"
+}
+
+test_local_only_rebased_patch_relocated_to_identical_block_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-relocated-identical-block)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' \
+    p1 p2 p3 p4 p5 \
+    context-one context-two context-three target context-four context-five context-six \
+    s1 s2 s3 s4 s5 s6 s7 s8 \
+    context-one context-two context-three target context-four context-five context-six \
+    z1 z2 z3 z4 z5 > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "add repeated baseline"
+  git -C "$case_dir/wt" rebase main >/dev/null
+
+  awk '$0 == "target" && !changed { print "landed"; changed = 1; next } { print }' \
+    "$case_dir/wt/shared.txt" > "$case_dir/wt/shared.next"
+  mv "$case_dir/wt/shared.next" "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change first repeated block"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  awk '$0 == "target" && !changed { print "landed"; changed = 1; next } { print }' \
+    "$case_dir/project/shared.txt" > "$case_dir/project/shared.next"
+  mv "$case_dir/project/shared.next" "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten first-block landing"
+  awk '
+    $0 == "landed" && !reverted { print "target"; reverted = 1; next }
+    $0 == "target" { print "landed"; next }
+    { print }
+  ' "$case_dir/project/shared.txt" > "$case_dir/project/shared.next"
+  mv "$case_dir/project/shared.next" "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "relocate landing to second block"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-relocated-identical-block: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-relocated-identical-block: no REFUSED line in stderr"
+  [ ! -e "$case_dir/treehouse-called" ] || fail "rebased-relocated-identical-block: destructive return was invoked"
+  [ "$(sed -n '9p' "$case_dir/wt/shared.txt")" = landed ] \
+    || fail "rebased-relocated-identical-block: worktree change was discarded"
+  pass "local-only worktree whose landed change moved to an identical block is refused"
+}
+
+test_local_only_rebased_inverse_sequence_with_net_zero_change_allows() {
+  local case_dir rc
+  case_dir=$(make_case rebased-net-zero-sequence)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' x > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "add baseline"
+  git -C "$case_dir/wt" rebase main >/dev/null
+  printf '%s\n' y > "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change x to y"
+  printf '%s\n' x > "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change y back to x"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' y > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten x to y"
+  printf '%s\n' x > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten y back to x"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "rebased-net-zero-sequence: teardown should allow"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "rebased-net-zero-sequence: teardown printed a REFUSED line"
+  [ -e "$case_dir/treehouse-called" ] || fail "rebased-net-zero-sequence: teardown did not invoke worktree return"
+  pass "local-only worktree whose rewritten inverse patches net to zero is torn down"
 }
 
 test_local_only_rebased_same_file_hunk_partially_reverted_refuses() {
@@ -3267,6 +3371,8 @@ test_local_only_rebased_patch_combined_revert_on_main_refuses
 test_local_only_rebased_patch_sequence_jointly_reverted_on_main_refuses
 test_local_only_rebased_multifile_patch_partially_reverted_on_main_refuses
 test_local_only_rebased_patch_reverted_then_relanded_allows
+test_local_only_rebased_patch_relocated_to_identical_block_refuses
+test_local_only_rebased_inverse_sequence_with_net_zero_change_allows
 test_local_only_rebased_same_file_hunk_partially_reverted_refuses
 test_local_only_rebased_added_line_partially_reverted_refuses
 test_local_only_rebased_added_line_replaced_refuses
