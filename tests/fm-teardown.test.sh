@@ -56,6 +56,7 @@
 #   (q2h) local-only + one added line reverted                   -> REFUSE (safety)
 #   (q2i) local-only + one added line replaced                   -> REFUSE (safety)
 #   (q2j) local-only + added file fully replaced                 -> REFUSE (safety)
+#   (q2k) local-only + unrelated line appended after landing     -> ALLOW  (superset)
 #   (q3) local-only + every patch landed but worktree dirty     -> REFUSE (dirty wins)
 #   (q4) no-mistakes + patch landed, all its content replaced   -> REFUSE (safety)
 #   (q5) local-only + rewritten rename patch landed              -> ALLOW  (rename fix)
@@ -1133,6 +1134,43 @@ SH
   grep -Fxq A "$case_dir/wt/feature.txt" || fail "rebased-added-file-replaced: worktree content was discarded"
   grep -Fxq B "$case_dir/wt/feature.txt" || fail "rebased-added-file-replaced: worktree content was discarded"
   pass "local-only worktree whose added file was fully replaced is refused"
+}
+
+test_local_only_rebased_added_file_superset_allows() {
+  local case_dir rc
+  case_dir=$(make_case rebased-added-file-superset)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' A > "$case_dir/wt/feature.txt"
+  git -C "$case_dir/wt" add -- feature.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "add feature"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' A > "$case_dir/project/feature.txt"
+  git -C "$case_dir/project" add -- feature.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten feature"
+  printf '%s\n' A B > "$case_dir/project/feature.txt"
+  git -C "$case_dir/project" add -- feature.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "append unrelated content"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "rebased-added-file-superset: teardown should allow"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "rebased-added-file-superset: teardown printed a REFUSED line"
+  [ -e "$case_dir/treehouse-called" ] || fail "rebased-added-file-superset: teardown did not invoke worktree return"
+  pass "local-only worktree whose landed file gained unrelated content is torn down"
 }
 
 test_local_only_rewritten_rename_patch_landed_allows() {
@@ -3192,6 +3230,7 @@ test_local_only_rebased_same_file_hunk_partially_reverted_refuses
 test_local_only_rebased_added_line_partially_reverted_refuses
 test_local_only_rebased_added_line_replaced_refuses
 test_local_only_rebased_added_file_fully_replaced_refuses
+test_local_only_rebased_added_file_superset_allows
 test_local_only_rebased_patch_landed_but_dirty_refuses
 test_no_mistakes_rebased_patch_landed_after_full_replacement_refuses
 test_local_only_rewritten_rename_patch_landed_allows
