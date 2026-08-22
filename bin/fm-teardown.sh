@@ -11,7 +11,8 @@
 # normal ship task whose commits are not so reachable - when its PR is merged and
 # GitHub reports a PR head that contains the current local work, its content is
 # already present in the up-to-date default branch, or every commit that branch
-# cannot reach is already present there as a PATCH. This recognizes the common
+# cannot reach is already present there as a PATCH that branch has not since
+# reverted. This recognizes the common
 # squash-merge-then-delete-branch flow, where the branch's own commits live nowhere
 # on a remote yet the change is fully in main, and the rebase case, where landing
 # rewrote every commit so no reachability test can ever succeed again (see
@@ -1041,24 +1042,50 @@ ensure_commit_object() {
   git -C "$WT" cat-file -e "$commit^{commit}" 2>/dev/null
 }
 
+# --no-prefix everywhere a patch id is taken: the default a/ and b/ prefixes swap
+# places under `-R`, so a patch and its own reverse would otherwise hash to
+# different ids and the revert check below could never match. It only has to be
+# consistent, since every id compared here is computed in the same repository.
 patch_id_for_commit() {
   local commit=$1
-  git -C "$WT" show --pretty=medium --no-ext-diff "$commit" 2>/dev/null \
+  git -C "$WT" show --pretty=medium --no-ext-diff --no-prefix "$commit" 2>/dev/null \
     | git patch-id --stable 2>/dev/null \
     | awk 'NR == 1 { print $1 }'
+}
+
+# Every distinct patch id the commits <git log args...> select carry, as ONE
+# `git log -p | git patch-id` pipeline - the batching `git cherry` itself uses -
+# rather than three processes per commit, so a reference side of any length costs
+# two processes instead of growing with the default branch's history. Commits that
+# emit no diff (empty commits, and merge commits whose conflict resolution
+# `git log -p` does not show) contribute nothing, which is what the reference side
+# wants: they can never prove a subject patch is present.
+patch_ids_for_log() {
+  git -C "$WT" log --format=%H --no-ext-diff --no-prefix -p "$@" 2>/dev/null \
+    | git patch-id --stable 2>/dev/null \
+    | awk 'NF { print $1 }' \
+    | sort -u
 }
 
 # The one patch-set comparison behind every landed-work patch check, so a future
 # fix to it can never land on only one copy. Takes the reference-side `git log`
 # arguments, the literal separator `::`, then the subject-side ones. Returns 0
-# when EVERY subject commit's patch is already present on the reference side, 2
-# when the subject side is empty so there is nothing to prove (the caller decides
-# what that means), and 1 for everything else: an unreadable git log, a reference
+# when EVERY subject commit's patch is already present on the reference side and
+# none of them is undone there again, 2 when the subject side is empty so there is
+# nothing to prove (the caller decides what that means), and 1 for everything
+# else: an unreadable git log, a subject side that touches no path, a reference
 # side that contributes no patch ids at all, an empty or unreadable subject patch
-# id, or any subject commit whose patch is missing.
+# id, any subject commit whose patch is missing, or any subject patch the
+# reference side also carries in REVERSE (the landed-then-reverted case, where the
+# work is no longer present and discarding it would lose it).
+# The reference scan is bounded to the paths the subject commits touch: a commit
+# can only carry a subject commit's patch if it touches exactly those paths, so
+# this can never drop a match, and it keeps unrelated default-branch history out
+# of the comparison. --full-history keeps path limiting from simplifying away a
+# commit that did touch them.
 subject_patches_are_in_reference() {
-  local -a ref_args=() subject_args=()
-  local past_separator=0 arg ref_ids subject_commits commit patch_id
+  local -a ref_args=() subject_args=() pathspecs=()
+  local past_separator=0 arg ref_ids reverted_ids subject_commits subject_paths commit patch_id path
   for arg in "$@"; do
     if [ "$past_separator" = 0 ] && [ "$arg" = '::' ]; then
       past_separator=1
@@ -1073,20 +1100,30 @@ subject_patches_are_in_reference() {
   [ "${#ref_args[@]}" -gt 0 ] && [ "${#subject_args[@]}" -gt 0 ] || return 1
   subject_commits=$(git -C "$WT" log --format=%H "${subject_args[@]}" -- 2>/dev/null) || return 1
   [ -n "$subject_commits" ] || return 2
-  ref_ids=$(
-    git -C "$WT" log --format=%H "${ref_args[@]}" -- 2>/dev/null \
-      | while IFS= read -r commit; do
-          patch_id_for_commit "$commit"
-        done \
+  subject_paths=$(
+    git -C "$WT" -c core.quotePath=false log --format= --name-only "${subject_args[@]}" -- 2>/dev/null \
       | sed '/^$/d' \
       | sort -u
   ) || return 1
+  [ -n "$subject_paths" ] || return 1
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    pathspecs+=(":(literal)$path")
+  done <<EOF
+$subject_paths
+EOF
+  [ "${#pathspecs[@]}" -gt 0 ] || return 1
+  ref_ids=$(patch_ids_for_log --full-history "${ref_args[@]}" -- "${pathspecs[@]}") || return 1
   [ -n "$ref_ids" ] || return 1
+  reverted_ids=$(patch_ids_for_log --full-history -R "${ref_args[@]}" -- "${pathspecs[@]}") || return 1
   while IFS= read -r commit; do
     [ -n "$commit" ] || continue
     patch_id=$(patch_id_for_commit "$commit") || return 1
     [ -n "$patch_id" ] || return 1
     printf '%s\n' "$ref_ids" | grep -qxF "$patch_id" || return 1
+    if [ -n "$reverted_ids" ] && printf '%s\n' "$reverted_ids" | grep -qxF "$patch_id"; then
+      return 1
+    fi
   done <<EOF
 $subject_commits
 EOF
@@ -1169,9 +1206,10 @@ content_in_ref() {
 # Deliberately strict, so it can only ever turn a refusal into an allow on proof:
 # EVERY unreachable commit must match, an unreadable or empty patch (an empty
 # commit, or a merge commit, whose conflict resolution `git show` does not emit)
-# never counts as landed, and a ref that contributes no patches at all is
-# inconclusive. Anything short of a complete match returns non-zero, so genuinely
-# unlanded work still refuses.
+# never counts as landed, a patch <ref> carries in reverse as well (it landed and
+# was then reverted, so the work is no longer there) does not count either, and a
+# ref that contributes no patches at all is inconclusive. Anything short of a
+# complete match returns non-zero, so genuinely unlanded work still refuses.
 patches_are_in_ref() {
   local ref=$1 status
   [ -n "$ref" ] || return 1

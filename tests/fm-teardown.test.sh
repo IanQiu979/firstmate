@@ -47,6 +47,7 @@
 #   (q) no-mistakes + NO pr= recorded, PR discovered by branch  -> ALLOW  (yolo/no-CI merge)
 #   (q1) local-only + patch landed under a rewritten commit     -> ALLOW  (rebase fix)
 #   (q2) local-only + one commit's patch absent from main       -> REFUSE (safety)
+#   (q2b) local-only + landed patch reverted on main again      -> REFUSE (safety)
 #   (q3) local-only + every patch landed but worktree dirty     -> REFUSE (dirty wins)
 #   (q4) no-mistakes + patch landed, main edited it afterwards  -> ALLOW  (rebase fix)
 #
@@ -281,6 +282,18 @@ land_rewritten_patch_on_local_main() {
   git -C "$case_dir/project" add -- "$file"
   git -C "$case_dir/project" -c user.email=t@t -c user.name=t \
     commit -q -m "rebased: add $file"
+}
+
+# Same rewritten-commit landing on the LOCAL default branch, followed by a commit
+# that reverts it again. The patch is in main's history but the work is gone from
+# main's tree, so teardown must not treat the branch as landed.
+# Args: case_dir file content
+land_rewritten_patch_then_revert_on_local_main() {
+  local case_dir=$1 file=$2 content=$3
+  land_rewritten_patch_on_local_main "$case_dir" "$file" "$content"
+  git -C "$case_dir/project" rm -q -- "$file"
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t \
+    commit -q -m "revert: drop $file again"
 }
 
 # Same rewritten-commit landing, but on origin's default branch, followed by a
@@ -743,6 +756,30 @@ test_local_only_rebased_patch_with_absent_commit_refuses() {
   grep -Fq "commits not yet on main" "$case_dir/stderr" \
     || fail "rebased-partial: refusal did not name the commits still missing from main"
   pass "local-only worktree with a commit whose patch is absent from main is refused"
+}
+
+test_local_only_rebased_patch_reverted_on_main_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-reverted)
+  write_meta "$case_dir" local-only ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  # The patch landed under a rewritten commit and main then reverted it, so the
+  # work exists nowhere but this worktree; patch equivalence must not clear it.
+  land_rewritten_patch_then_revert_on_local_main "$case_dir" feature.txt hello
+  [ ! -e "$case_dir/project/feature.txt" ] \
+    || fail "rebased-reverted: feature.txt is still in main's tree; case is vacuous"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-reverted: teardown should refuse when the landed patch was reverted"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-reverted: no REFUSED line in stderr"
+  grep -Fq "commits not yet on main" "$case_dir/stderr" \
+    || fail "rebased-reverted: refusal did not name the commits still missing from main"
+  [ -e "$case_dir/wt/feature.txt" ] || fail "rebased-reverted: worktree work was discarded"
+  pass "local-only worktree whose landed patch was reverted on main is refused"
 }
 
 test_local_only_rebased_patch_landed_but_dirty_refuses() {
@@ -2738,6 +2775,7 @@ test_local_only_truly_unpushed_refuses
 test_local_only_merged_to_local_main_allows
 test_local_only_rebased_patch_landed_allows
 test_local_only_rebased_patch_with_absent_commit_refuses
+test_local_only_rebased_patch_reverted_on_main_refuses
 test_local_only_rebased_patch_landed_but_dirty_refuses
 test_no_mistakes_rebased_patch_landed_after_later_edit_allows
 test_no_mistakes_origin_remote_allows
