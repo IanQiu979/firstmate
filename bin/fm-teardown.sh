@@ -17,6 +17,17 @@
 # on a remote yet the change is fully in main, and the rebase case, where landing
 # rewrote every commit so no reachability test can ever succeed again (see
 # patches_are_in_ref).
+# The merged-PR path and the default-branch patch path deliberately DIFFER, and a
+# future reader must not "unify" them.
+# The merged-PR path is patch-id containment only: every unpushed commit's patch
+# must appear in the PR head, and that is the whole test.
+# That path is already anchored by a merged PR, whose head is expected to keep
+# evolving past the local commits under review fixes and rewrites, so demanding
+# the local change still be present verbatim in the PR head's tree would refuse
+# work that genuinely landed.
+# The default-branch patch path additionally requires the tree-representation
+# proof, because nothing else there rules out a patch that landed and was then
+# reverted, partially reverted, relocated, or replaced.
 # The PR itself is resolved from the task's recorded pr= when present, or - when
 # no pr= was ever recorded (e.g. a yolo-authorized merge on a repo with no PR CI,
 # where the usual "checks green" fm-pr-check.sh trigger never fires) - by looking
@@ -1097,6 +1108,17 @@ patch_ids_for_log() {
   return "$status"
 }
 
+# The single teardown-and-refuse step every failing arm of
+# changes_are_represented_in_tree takes: remove the scratch index and its
+# directory, then report "not represented". Always returns 1, so each arm is one
+# call plus its own `return 1` and no copy of the cleanup can drift.
+changes_are_represented_in_tree_fail() {
+  local tmp=$1
+  rm -f -- "$tmp/index" "$tmp/index.lock"
+  rmdir "$tmp" 2>/dev/null || true
+  return 1
+}
+
 changes_are_represented_in_tree() {
   local pre=$1 post=$2 tree=$3 paths path tmp status pre_entry post_entry current_entry
   local post_meta current_meta post_mode post_type post_oid current_mode current_type current_oid
@@ -1105,22 +1127,21 @@ changes_are_represented_in_tree() {
   [ -n "$paths" ] || return 1
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-current-tree.XXXXXX") || return 1
   if ! GIT_INDEX_FILE="$tmp/index" git -C "$WT" read-tree "$tree" 2>/dev/null; then
-    rm -f -- "$tmp/index" "$tmp/index.lock"
-    rmdir "$tmp" 2>/dev/null || true
+    changes_are_represented_in_tree_fail "$tmp"
     return 1
   fi
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     if ! git -C "$WT" diff --binary --full-index --no-ext-diff --no-prefix --no-renames "$pre" "$post" -- ":(literal)$path" > "$tmp/path.patch" 2>/dev/null; then
-      rm -f -- "$tmp/path.patch" "$tmp/index" "$tmp/index.lock"
-      rmdir "$tmp" 2>/dev/null || true
+      rm -f -- "$tmp/path.patch"
+      changes_are_represented_in_tree_fail "$tmp"
       return 1
     fi
-    [ -s "$tmp/path.patch" ] || {
-      rm -f -- "$tmp/path.patch" "$tmp/index" "$tmp/index.lock"
-      rmdir "$tmp" 2>/dev/null || true
+    if [ ! -s "$tmp/path.patch" ]; then
+      rm -f -- "$tmp/path.patch"
+      changes_are_represented_in_tree_fail "$tmp"
       return 1
-    }
+    fi
     LC_ALL=C GIT_INDEX_FILE="$tmp/index" git -C "$WT" apply --cached --check --reverse --verbose -p0 \
       "$tmp/path.patch" > /dev/null 2> "$tmp/apply-output"
     status=$?
@@ -1130,36 +1151,30 @@ changes_are_represented_in_tree() {
       status=$?
       rm -f -- "$tmp/apply-output"
       if [ "$status" -ne 1 ]; then
-        rm -f -- "$tmp/index" "$tmp/index.lock"
-        rmdir "$tmp" 2>/dev/null || true
+        changes_are_represented_in_tree_fail "$tmp"
         return 1
       fi
       continue
     fi
     rm -f -- "$tmp/apply-output"
     pre_entry=$(git -C "$WT" -c core.quotePath=false ls-tree "$pre" -- ":(literal)$path" 2>/dev/null) || {
-      rm -f -- "$tmp/index" "$tmp/index.lock"
-      rmdir "$tmp" 2>/dev/null || true
+      changes_are_represented_in_tree_fail "$tmp"
       return 1
     }
     [ -z "$pre_entry" ] || {
-      rm -f -- "$tmp/index" "$tmp/index.lock"
-      rmdir "$tmp" 2>/dev/null || true
+      changes_are_represented_in_tree_fail "$tmp"
       return 1
     }
     post_entry=$(git -C "$WT" -c core.quotePath=false ls-tree "$post" -- ":(literal)$path" 2>/dev/null) || {
-      rm -f -- "$tmp/index" "$tmp/index.lock"
-      rmdir "$tmp" 2>/dev/null || true
+      changes_are_represented_in_tree_fail "$tmp"
       return 1
     }
     current_entry=$(git -C "$WT" -c core.quotePath=false ls-tree "$tree" -- ":(literal)$path" 2>/dev/null) || {
-      rm -f -- "$tmp/index" "$tmp/index.lock"
-      rmdir "$tmp" 2>/dev/null || true
+      changes_are_represented_in_tree_fail "$tmp"
       return 1
     }
     [ -n "$post_entry" ] && [ -n "$current_entry" ] || {
-      rm -f -- "$tmp/index" "$tmp/index.lock"
-      rmdir "$tmp" 2>/dev/null || true
+      changes_are_represented_in_tree_fail "$tmp"
       return 1
     }
     post_meta=${post_entry%%$'\t'*}
@@ -1173,37 +1188,31 @@ EOF
     case "$post_mode:$post_type:$current_mode:$current_type" in
       100644:blob:100644:blob|100755:blob:100755:blob) ;;
       *)
-        rm -f -- "$tmp/index" "$tmp/index.lock"
-        rmdir "$tmp" 2>/dev/null || true
+        changes_are_represented_in_tree_fail "$tmp"
         return 1
         ;;
     esac
     [ -n "$post_oid" ] && [ -n "$current_oid" ] || {
-      rm -f -- "$tmp/index" "$tmp/index.lock"
-      rmdir "$tmp" 2>/dev/null || true
+      changes_are_represented_in_tree_fail "$tmp"
       return 1
     }
     numstat=$(git -C "$WT" diff --numstat --no-renames "$pre" "$post" -- ":(literal)$path" 2>/dev/null) || {
-      rm -f -- "$tmp/index" "$tmp/index.lock"
-      rmdir "$tmp" 2>/dev/null || true
+      changes_are_represented_in_tree_fail "$tmp"
       return 1
     }
     current_numstat=$(git -C "$WT" diff --numstat --no-renames "$post" "$tree" -- ":(literal)$path" 2>/dev/null) || {
-      rm -f -- "$tmp/index" "$tmp/index.lock"
-      rmdir "$tmp" 2>/dev/null || true
+      changes_are_represented_in_tree_fail "$tmp"
       return 1
     }
     case "$numstat" in
       -$'\t'-$'\t'*)
-        rm -f -- "$tmp/index" "$tmp/index.lock"
-        rmdir "$tmp" 2>/dev/null || true
+        changes_are_represented_in_tree_fail "$tmp"
         return 1
         ;;
     esac
     case "$current_numstat" in
       -$'\t'-$'\t'*)
-        rm -f -- "$tmp/index" "$tmp/index.lock"
-        rmdir "$tmp" 2>/dev/null || true
+        changes_are_represented_in_tree_fail "$tmp"
         return 1
         ;;
     esac
@@ -1212,28 +1221,24 @@ $current_numstat
 EOF
     case "$current_path" in
       '')
-        rm -f -- "$tmp/index" "$tmp/index.lock"
-        rmdir "$tmp" 2>/dev/null || true
+        changes_are_represented_in_tree_fail "$tmp"
         return 1
         ;;
     esac
     case "$current_additions" in
       ''|*[!0-9]*)
-        rm -f -- "$tmp/index" "$tmp/index.lock"
-        rmdir "$tmp" 2>/dev/null || true
+        changes_are_represented_in_tree_fail "$tmp"
         return 1
         ;;
     esac
     case "$current_deletions" in
       ''|*[!0-9]*)
-        rm -f -- "$tmp/index" "$tmp/index.lock"
-        rmdir "$tmp" 2>/dev/null || true
+        changes_are_represented_in_tree_fail "$tmp"
         return 1
         ;;
     esac
     if [ "$current_deletions" -ne 0 ]; then
-      rm -f -- "$tmp/index" "$tmp/index.lock"
-      rmdir "$tmp" 2>/dev/null || true
+      changes_are_represented_in_tree_fail "$tmp"
       return 1
     fi
   done <<EOF
@@ -1245,16 +1250,21 @@ EOF
 }
 
 # The one patch-set comparison behind every landed-work patch check, so a future
-# fix to it can never land on only one copy. Takes the reference-side `git log`
-# arguments, the literal separator `::`, then the subject-side ones. Returns 0
-# when EVERY subject commit's patch appeared on the reference side and every
-# changed path remains represented in its current tree, 2 when the subject side
-# is empty so there is nothing to prove (the caller decides what that means), and
-# 1 for everything
+# fix to it can never land on only one copy. Takes the proof mode
+# (`patch-ids-only` or `with-tree-proof`), the reference tree the tree proof runs
+# against, the reference-side `git log` arguments, the literal separator `::`,
+# then the subject-side ones. Returns 0 when EVERY subject commit's patch
+# appeared on the reference side and - under `with-tree-proof` only - every
+# changed path remains represented in that reference tree, 2 when the subject
+# side is empty so there is nothing to prove (the caller decides what that
+# means), and 1 for everything
 # else: an unreadable git log, a subject side that touches no path, a reference
 # side that contributes no patch ids at all, an empty or unreadable subject patch
-# id, any subject commit whose patch is missing, or any subject path whose change
-# is no longer represented in the current reference tree.
+# id, any subject commit whose patch is missing, or - under `with-tree-proof` -
+# any subject path whose change is no longer represented in the current reference
+# tree.
+# The two modes differ deliberately: see the merged-PR contract in this file's
+# header comment before unifying them.
 # The reference scan is bounded to the paths the subject commits touch: a commit
 # can only carry a subject commit's patch if it touches exactly those paths, so
 # this can never drop a match, and it keeps unrelated default-branch history out
@@ -1262,10 +1272,16 @@ EOF
 # commit that did touch them.
 subject_patches_are_in_reference() {
   local -a ref_args=() subject_args=() pathspecs=()
-  local reference_tree=$1 past_separator=0 arg ref_ids subject_commits subject_paths commit patch_id path status
+  local mode=$1 reference_tree=$2 past_separator=0 arg ref_ids subject_commits subject_paths commit patch_id path status
   local subject_tip='' subject_oldest='' subject_base
-  shift
-  git -C "$WT" rev-parse --verify "$reference_tree^{tree}" >/dev/null 2>&1 || return 1
+  shift 2
+  case "$mode" in
+    patch-ids-only|with-tree-proof) ;;
+    *) return 1 ;;
+  esac
+  if [ "$mode" = with-tree-proof ]; then
+    git -C "$WT" rev-parse --verify "$reference_tree^{tree}" >/dev/null 2>&1 || return 1
+  fi
   for arg in "$@"; do
     if [ "$past_separator" = 0 ] && [ "$arg" = '::' ]; then
       past_separator=1
@@ -1301,6 +1317,7 @@ EOF
   done <<EOF
 $subject_commits
 EOF
+  [ "$mode" = with-tree-proof ] || return 0
   [ -n "$subject_tip" ] && [ -n "$subject_oldest" ] || return 1
   subject_base=$(git -C "$WT" rev-parse --verify "$subject_oldest^" 2>/dev/null) || return 1
   git -C "$WT" diff --quiet --no-ext-diff --no-renames "$subject_base" "$subject_tip" -- 2>/dev/null
@@ -1316,11 +1333,14 @@ EOF
   changes_are_represented_in_tree "$subject_base" "$subject_tip" "$reference_tree"
 }
 
+# Patch-id containment against a merged PR's head, and nothing more: see the
+# merged-PR contract in this file's header comment for why this path deliberately
+# skips the tree-representation proof that patches_are_in_ref requires.
 unpushed_patches_are_in_pr_head() {
   local pr_head=$1 current base
   current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
   base=$(git -C "$WT" merge-base "$current" "$pr_head" 2>/dev/null) || return 1
-  subject_patches_are_in_reference "$pr_head" "$base..$pr_head" :: HEAD --not --remotes
+  subject_patches_are_in_reference patch-ids-only "$pr_head" "$base..$pr_head" :: HEAD --not --remotes
 }
 
 # Is the worktree's PR merged for local work contained in that PR? Resolves the
@@ -1400,7 +1420,7 @@ content_in_ref() {
 patches_are_in_ref() {
   local ref=$1 status
   [ -n "$ref" ] || return 1
-  subject_patches_are_in_reference "$ref" "$ref" --not HEAD :: HEAD --not "$ref"
+  subject_patches_are_in_reference with-tree-proof "$ref" "$ref" --not HEAD :: HEAD --not "$ref"
   status=$?
   [ "$status" -eq 0 ] || [ "$status" -eq 2 ]
 }

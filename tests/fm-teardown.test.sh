@@ -42,6 +42,7 @@
 #   (l) no-mistakes + stale origin/main but fetched content     -> ALLOW  (fresh fetch)
 #   (m) no-mistakes + local HEAD ancestor of merged PR head     -> ALLOW  (lagging local)
 #   (n) no-mistakes + replayed unpushed patch in merged PR head -> ALLOW  (replayed local)
+#   (n1) no-mistakes + merged PR head evolved past local commit -> ALLOW  (evolved PR head)
 #   (o) fm-pr-check rerun after HEAD moved                      -> no stale pr_head
 #   (p) fm-pr-check when local HEAD lags                        -> record remote PR head
 #   (q) no-mistakes + NO pr= recorded, PR discovered by branch  -> ALLOW  (yolo/no-CI merge)
@@ -1605,6 +1606,47 @@ test_squash_merged_pr_allows_replayed_unpushed_patch() {
   expect_code 0 "$rc" "squash-replayed-patch: teardown should succeed when unpushed local patch is in the merged PR head"
   ! grep -q REFUSED "$case_dir/stderr" || fail "squash-replayed-patch: teardown printed a REFUSED line"
   pass "squash-merged PR accepts replayed unpushed local patches contained in the PR head"
+}
+
+test_merged_pr_head_evolved_after_local_commit_allows() {
+  local case_dir rc parent_head pr_head tmp
+  case_dir=$(make_case pr-head-evolved)
+  write_meta "$case_dir" no-mistakes ship
+  # The merged-PR path is patch-id containment only, deliberately: the pipeline
+  # replays the local commit onto the PR branch and then keeps fixing it there,
+  # so the PR head's tree no longer holds the local change verbatim even though
+  # the work genuinely landed. Requiring the local change to still be present in
+  # the PR head's tree would false-refuse this.
+  wt_commit_file "$case_dir" local-parent.txt parent "local parent"
+  parent_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  git -C "$case_dir/wt" push -q origin "$parent_head:refs/heads/fm/task-x1"
+  git -C "$case_dir/project" fetch -q origin fm/task-x1
+  printf 'A\nB\n' > "$case_dir/wt/feature.txt"
+  git -C "$case_dir/wt" add -- feature.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "add feature"
+  append_pr_meta_url "$case_dir"
+  tmp="$case_dir/_evolved"
+  git clone -q "$case_dir/origin.git" "$tmp"
+  printf 'A\nB\n' > "$tmp/feature.txt"
+  git -C "$tmp" add -- feature.txt
+  git -C "$tmp" -c user.email=t@t -c user.name=t commit -q -m "add feature"
+  printf 'A\nC\n' > "$tmp/feature.txt"
+  git -C "$tmp" add -- feature.txt
+  git -C "$tmp" -c user.email=t@t -c user.name=t commit -q -m "review fix on the PR branch"
+  git -C "$tmp" push -q origin HEAD:refs/heads/pr-head
+  git -C "$case_dir/project" fetch -q origin pr-head
+  rm -rf "$tmp"
+  pr_head=$(git -C "$case_dir/project" rev-parse refs/remotes/origin/pr-head)
+  add_gh_pr_merged_for_head "$case_dir" "$pr_head"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "pr-head-evolved: teardown should succeed when the merged PR head evolved past the local commit"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "pr-head-evolved: teardown printed a REFUSED line"
+  pass "merged-PR path stays patch-id containment when the PR head evolved after the local commit"
 }
 
 test_merged_pr_with_later_local_commit_refuses() {
@@ -3452,6 +3494,7 @@ test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows
 test_squash_merged_pr_allows_replayed_unpushed_patch
+test_merged_pr_head_evolved_after_local_commit_allows
 test_merged_pr_with_later_local_commit_refuses
 test_pr_check_does_not_refresh_stale_pr_head
 test_pr_check_records_remote_head_when_local_lags
