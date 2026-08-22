@@ -1097,99 +1097,115 @@ patch_ids_for_log() {
   return "$status"
 }
 
-patch_applies_to_tree() {
-  local patch=$1 tree=$2 direction=$3 tmp status
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-patch-apply.XXXXXX") || return 2
-  if ! GIT_INDEX_FILE="$tmp/index" git -C "$WT" read-tree "$tree" 2>/dev/null; then
-    rm -f -- "$tmp/index"
-    rmdir "$tmp" 2>/dev/null || true
-    return 2
-  fi
-  if [ "$direction" = reverse ]; then
-    GIT_INDEX_FILE="$tmp/index" git -C "$WT" apply --cached --check --unidiff-zero -p0 --reverse "$patch" >/dev/null 2>&1
-  else
-    GIT_INDEX_FILE="$tmp/index" git -C "$WT" apply --cached --check --unidiff-zero -p0 "$patch" >/dev/null 2>&1
-  fi
-  status=$?
-  rm -f -- "$tmp/index"
-  rmdir "$tmp" 2>/dev/null || true
-  case "$status" in
-    0) return 0 ;;
-    1) return 1 ;;
-    *) return 2 ;;
-  esac
-}
-
-patch_parts_are_represented_in_tree() {
-  local patch=$1 tree=$2 tmp=$3 fragment_count fragment status i
-  fragment_count=$(awk -v prefix="$tmp/fragment." '
-    BEGIN { count = 0; header_count = 0; file = "" }
-    count == 0 && $0 !~ /^@@ / { header[++header_count] = $0; next }
-    /^@@ / {
-      if (file != "") close(file)
-      count++
-      file = prefix count
-      for (i = 1; i <= header_count; i++) print header[i] > file
-      print $0 > file
-      next
-    }
-    count > 0 { print $0 > file }
-    END {
-      if (file != "") close(file)
-      print count
-    }
-  ' "$patch") || return 1
-  case "$fragment_count" in
-    0)
-      patch_applies_to_tree "$patch" "$tree" forward
-      status=$?
-      ;;
-    *[!0-9]*|'') return 1 ;;
-    *)
-      status=1
-      i=1
-      while [ "$i" -le "$fragment_count" ]; do
-        fragment="$tmp/fragment.$i"
-        [ -s "$fragment" ] || return 1
-        patch_applies_to_tree "$fragment" "$tree" forward
-        status=$?
-        [ "$status" -eq 1 ] || break
-        i=$((i + 1))
-      done
-      ;;
-  esac
-  [ "$status" -eq 1 ]
-}
-
 commit_paths_are_represented_in_tree() {
-  local commit=$1 tree=$2 paths path tmp status
+  local commit=$1 tree=$2 paths path tmp parent pre_entry post_entry current_entry
+  local pre_meta post_meta current_meta pre_mode post_mode current_mode pre_oid post_oid current_oid
+  local numstat status
   paths=$(git -C "$WT" -c core.quotePath=false show --format= --name-only --no-renames "$commit" -- 2>/dev/null) || return 1
   [ -n "$paths" ] || return 1
+  parent=$(git -C "$WT" rev-parse --verify "$commit^" 2>/dev/null) || return 1
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-current-tree.XXXXXX") || return 1
   while IFS= read -r path; do
     [ -n "$path" ] || continue
-    if ! git -C "$WT" show --format= --binary --full-index --no-ext-diff --no-prefix --no-renames "$commit" -- ":(literal)$path" > "$tmp/patch" 2>/dev/null; then
-      rm -f -- "$tmp/patch"
+    pre_entry=$(git -C "$WT" -c core.quotePath=false ls-tree "$parent" -- ":(literal)$path" 2>/dev/null) || {
+      rmdir "$tmp" 2>/dev/null || true
+      return 1
+    }
+    post_entry=$(git -C "$WT" -c core.quotePath=false ls-tree "$commit" -- ":(literal)$path" 2>/dev/null) || {
+      rmdir "$tmp" 2>/dev/null || true
+      return 1
+    }
+    current_entry=$(git -C "$WT" -c core.quotePath=false ls-tree "$tree" -- ":(literal)$path" 2>/dev/null) || {
+      rmdir "$tmp" 2>/dev/null || true
+      return 1
+    }
+    if [ -z "$post_entry" ]; then
+      [ -z "$current_entry" ] || {
+        rmdir "$tmp" 2>/dev/null || true
+        return 1
+      }
+      continue
+    fi
+    [ -n "$current_entry" ] || {
+      rmdir "$tmp" 2>/dev/null || true
+      return 1
+    }
+    pre_meta=${pre_entry%%$'\t'*}
+    post_meta=${post_entry%%$'\t'*}
+    current_meta=${current_entry%%$'\t'*}
+    read -r pre_mode _ pre_oid <<EOF
+$pre_meta
+EOF
+    read -r post_mode _ post_oid <<EOF
+$post_meta
+EOF
+    read -r current_mode _ current_oid <<EOF
+$current_meta
+EOF
+    [ -n "$post_oid" ] && [ -n "$current_oid" ] && [ "$post_mode" = "$current_mode" ] || {
+      rmdir "$tmp" 2>/dev/null || true
+      return 1
+    }
+    [ "$post_oid" != "$current_oid" ] || continue
+    numstat=$(git -C "$WT" diff --numstat --no-renames "$parent" "$commit" -- ":(literal)$path" 2>/dev/null) || {
+      rmdir "$tmp" 2>/dev/null || true
+      return 1
+    }
+    case "$numstat" in
+      -$'\t'-$'\t'*)
+        rmdir "$tmp" 2>/dev/null || true
+        return 1
+        ;;
+    esac
+    if ! git -C "$WT" diff --unified=0 --no-ext-diff --no-renames "$parent" "$commit" -- ":(literal)$path" > "$tmp/original.diff" 2>/dev/null; then
+      rm -f -- "$tmp/original.diff"
       rmdir "$tmp" 2>/dev/null || true
       return 1
     fi
-    [ -s "$tmp/patch" ] || {
-      rm -f -- "$tmp/patch"
+    if ! git -C "$WT" cat-file blob "$post_oid" > "$tmp/post" 2>/dev/null; then
+      rm -f -- "$tmp/original.diff" "$tmp/post"
       rmdir "$tmp" 2>/dev/null || true
       return 1
-    }
-    patch_parts_are_represented_in_tree "$tmp/patch" "$tree" "$tmp"
+    fi
+    if ! git -C "$WT" cat-file blob "$current_oid" > "$tmp/current" 2>/dev/null; then
+      rm -f -- "$tmp/original.diff" "$tmp/post" "$tmp/current"
+      rmdir "$tmp" 2>/dev/null || true
+      return 1
+    fi
+    git -C "$WT" diff --no-index --unified=0 --no-ext-diff --no-prefix "$tmp/post" "$tmp/current" > "$tmp/current.diff" 2>/dev/null
     status=$?
-    rm -f -- "$tmp"/fragment.*
-    [ "$status" -eq 0 ] || {
-      rm -f -- "$tmp/patch"
+    [ "$status" -le 1 ] || {
+      rm -f -- "$tmp/original.diff" "$tmp/post" "$tmp/current" "$tmp/current.diff"
       rmdir "$tmp" 2>/dev/null || true
       return 1
     }
+    if ! awk '
+      FNR == NR {
+        if ($0 ~ /^-/ && $0 !~ /^--- /) original_removed[substr($0, 2)] = 1
+        next
+      }
+      function finish_hunk() {
+        if (in_hunk && removed > added) bad = 1
+        removed = 0
+        added = 0
+      }
+      /^@@ / { finish_hunk(); in_hunk = 1; next }
+      in_hunk && /^-/ && $0 !~ /^--- / { removed++; next }
+      in_hunk && /^\+/ && $0 !~ /^\+\+\+ / {
+        added++
+        if (substr($0, 2) in original_removed) bad = 1
+        next
+      }
+      END { finish_hunk(); exit bad ? 1 : 0 }
+    ' "$tmp/original.diff" "$tmp/current.diff"; then
+      rm -f -- "$tmp/original.diff" "$tmp/post" "$tmp/current" "$tmp/current.diff"
+      rmdir "$tmp" 2>/dev/null || true
+      return 1
+    fi
+    rm -f -- "$tmp/original.diff" "$tmp/post" "$tmp/current" "$tmp/current.diff"
   done <<EOF
 $paths
 EOF
-  rm -f -- "$tmp/patch"
   rmdir "$tmp" 2>/dev/null || true
   return 0
 }
