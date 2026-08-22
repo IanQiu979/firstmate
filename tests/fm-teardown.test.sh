@@ -49,6 +49,7 @@
 #   (q2) local-only + one commit's patch absent from main       -> REFUSE (safety)
 #   (q2b) local-only + landed patch reverted on main again      -> REFUSE (safety)
 #   (q2c) local-only + combined revert on main                   -> REFUSE (safety)
+#   (q2d) local-only + two landed patches jointly reverted      -> REFUSE (safety)
 #   (q3) local-only + every patch landed but worktree dirty     -> REFUSE (dirty wins)
 #   (q4) no-mistakes + patch landed, main edited it afterwards  -> ALLOW  (rebase fix)
 #   (q5) local-only + rewritten rename patch landed              -> ALLOW  (rename fix)
@@ -839,6 +840,55 @@ test_local_only_rebased_patch_combined_revert_on_main_refuses() {
   grep -q REFUSED "$case_dir/stderr" || fail "rebased-combined-revert: no REFUSED line in stderr"
   [ -e "$case_dir/wt/shared.txt" ] || fail "rebased-combined-revert: worktree work was discarded"
   pass "local-only worktree whose patch was reverted with other work is refused"
+}
+
+test_local_only_rebased_patch_sequence_jointly_reverted_on_main_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-sequence-reverted)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' x > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "add baseline"
+  git -C "$case_dir/wt" rebase main >/dev/null
+
+  printf '%s\n' y > "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change x to y"
+  printf '%s\n' z > "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change y to z"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' y > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten x to y"
+  printf '%s\n' z > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten y to z"
+  printf '%s\n' x > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "jointly revert sequence"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-sequence-reverted: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-sequence-reverted: no REFUSED line in stderr"
+  [ ! -e "$case_dir/treehouse-called" ] || fail "rebased-sequence-reverted: destructive return was invoked"
+  [ -e "$case_dir/wt/shared.txt" ] || fail "rebased-sequence-reverted: worktree work was discarded"
+  pass "local-only worktree whose landed patch sequence was jointly reverted is refused"
 }
 
 test_local_only_rewritten_rename_patch_landed_allows() {
@@ -2885,6 +2935,7 @@ test_local_only_rebased_patch_landed_allows
 test_local_only_rebased_patch_with_absent_commit_refuses
 test_local_only_rebased_patch_reverted_on_main_refuses
 test_local_only_rebased_patch_combined_revert_on_main_refuses
+test_local_only_rebased_patch_sequence_jointly_reverted_on_main_refuses
 test_local_only_rebased_patch_landed_but_dirty_refuses
 test_no_mistakes_rebased_patch_landed_after_later_edit_allows
 test_local_only_rewritten_rename_patch_landed_allows

@@ -1122,57 +1122,86 @@ patch_applies_to_tree() {
   esac
 }
 
+patch_file_was_reversed_by_reference_commits() {
+  local patch=$1 reference_commits=$2 parents candidate parent status
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    parents=$(git -C "$WT" rev-list --parents -n 1 "$candidate" 2>/dev/null) || {
+      return 2
+    }
+    parents=${parents#* }
+    [ "$parents" != "$candidate" ] || continue
+    for parent in $parents; do
+      patch_applies_to_tree "$patch" "$parent" reverse
+      status=$?
+      case "$status" in
+        0) ;;
+        1) continue ;;
+        *) return 2 ;;
+      esac
+      patch_applies_to_tree "$patch" "$candidate" forward
+      status=$?
+      case "$status" in
+        0) return 0 ;;
+        1) ;;
+        *) return 2 ;;
+      esac
+    done
+  done <<EOF
+$reference_commits
+EOF
+  return 1
+}
+
 patch_was_reversed_by_reference_commits() {
-  local subject=$1 reference_commits=$2 tmp parents candidate parent status
+  local subject=$1 reference_commits=$2 tmp status
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-reverse-scan.XXXXXX") || return 2
   if ! git -C "$WT" show --format= --binary --full-index --no-ext-diff --no-prefix "$subject" > "$tmp/patch" 2>/dev/null; then
     rm -f -- "$tmp/patch"
     rmdir "$tmp" 2>/dev/null || true
     return 2
   fi
-  while IFS= read -r candidate; do
-    [ -n "$candidate" ] || continue
-    parents=$(git -C "$WT" rev-list --parents -n 1 "$candidate" 2>/dev/null) || {
-      rm -f -- "$tmp/patch"
-      rmdir "$tmp" 2>/dev/null || true
-      return 2
-    }
-    parents=${parents#* }
-    [ "$parents" != "$candidate" ] || continue
-    for parent in $parents; do
-      patch_applies_to_tree "$tmp/patch" "$parent" reverse
-      status=$?
-      case "$status" in
-        0) ;;
-        1) continue ;;
-        *)
-          rm -f -- "$tmp/patch"
-          rmdir "$tmp" 2>/dev/null || true
-          return 2
-          ;;
-      esac
-      patch_applies_to_tree "$tmp/patch" "$candidate" forward
-      status=$?
-      case "$status" in
-        0)
-          rm -f -- "$tmp/patch"
-          rmdir "$tmp" 2>/dev/null || true
-          return 0
-          ;;
-        1) ;;
-        *)
-          rm -f -- "$tmp/patch"
-          rmdir "$tmp" 2>/dev/null || true
-          return 2
-          ;;
-      esac
-    done
-  done <<EOF
-$reference_commits
-EOF
+  patch_file_was_reversed_by_reference_commits "$tmp/patch" "$reference_commits"
+  status=$?
   rm -f -- "$tmp/patch"
   rmdir "$tmp" 2>/dev/null || true
-  return 1
+  return "$status"
+}
+
+subject_sequence_was_reversed_by_reference_commits() {
+  local subject_commits=$1 reference_commits=$2 newest= oldest= commit base tmp status count=0
+  while IFS= read -r commit; do
+    [ -n "$commit" ] || continue
+    [ -n "$newest" ] || newest=$commit
+    oldest=$commit
+    count=$((count + 1))
+  done <<EOF
+$subject_commits
+EOF
+  [ "$count" -gt 1 ] || return 1
+  while IFS= read -r commit; do
+    [ -n "$commit" ] || continue
+    git -C "$WT" merge-base --is-ancestor "$commit" "$newest" 2>/dev/null || return 2
+  done <<EOF
+$subject_commits
+EOF
+  base=$(git -C "$WT" rev-parse --verify "$oldest^" 2>/dev/null) || return 2
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-sequence-scan.XXXXXX") || return 2
+  if ! git -C "$WT" diff --binary --full-index --no-ext-diff --no-prefix "$base" "$newest" -- > "$tmp/patch" 2>/dev/null; then
+    rm -f -- "$tmp/patch"
+    rmdir "$tmp" 2>/dev/null || true
+    return 2
+  fi
+  [ -s "$tmp/patch" ] || {
+    rm -f -- "$tmp/patch"
+    rmdir "$tmp" 2>/dev/null || true
+    return 2
+  }
+  patch_file_was_reversed_by_reference_commits "$tmp/patch" "$reference_commits"
+  status=$?
+  rm -f -- "$tmp/patch"
+  rmdir "$tmp" 2>/dev/null || true
+  return "$status"
 }
 
 # The one patch-set comparison behind every landed-work patch check, so a future
@@ -1235,6 +1264,9 @@ EOF
   done <<EOF
 $subject_commits
 EOF
+  subject_sequence_was_reversed_by_reference_commits "$subject_commits" "$reference_commits"
+  status=$?
+  [ "$status" -eq 1 ] || return 1
 }
 
 unpushed_patches_are_in_pr_head() {
