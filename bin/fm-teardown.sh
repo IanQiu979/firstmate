@@ -1210,6 +1210,13 @@ EOF
     IFS=$'\t' read -r current_additions current_deletions current_path <<EOF
 $current_numstat
 EOF
+    case "$current_path" in
+      '')
+        rm -f -- "$tmp/index" "$tmp/index.lock"
+        rmdir "$tmp" 2>/dev/null || true
+        return 1
+        ;;
+    esac
     case "$current_additions" in
       ''|*[!0-9]*)
         rm -f -- "$tmp/index" "$tmp/index.lock"
@@ -1256,7 +1263,7 @@ EOF
 subject_patches_are_in_reference() {
   local -a ref_args=() subject_args=() pathspecs=()
   local reference_tree=$1 past_separator=0 arg ref_ids subject_commits subject_paths commit patch_id path status
-  local subject_tip= subject_oldest= subject_base
+  local subject_tip='' subject_oldest='' subject_base
   shift
   git -C "$WT" rev-parse --verify "$reference_tree^{tree}" >/dev/null 2>&1 || return 1
   for arg in "$@"; do
@@ -1299,9 +1306,10 @@ EOF
   git -C "$WT" diff --quiet --no-ext-diff --no-renames "$subject_base" "$subject_tip" -- 2>/dev/null
   status=$?
   if [ "$status" -eq 0 ]; then
-    git -C "$WT" diff --quiet --no-ext-diff --no-renames "$subject_tip" "$reference_tree" -- \
-      "${pathspecs[@]}" 2>/dev/null
-    [ "$?" -eq 0 ] || return 1
+    if ! git -C "$WT" diff --quiet --no-ext-diff --no-renames "$subject_tip" "$reference_tree" -- \
+      "${pathspecs[@]}" 2>/dev/null; then
+      return 1
+    fi
     return 0
   fi
   [ "$status" -eq 1 ] || return 1
