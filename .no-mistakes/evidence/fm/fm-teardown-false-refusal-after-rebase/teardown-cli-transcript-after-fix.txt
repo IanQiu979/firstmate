@@ -1,0 +1,65 @@
+
+=========================================================
+$ SCENARIO 1: branch content landed under a rewritten (rebased) commit -> expect ALLOW
+=========================================================
+
+--- git state (branch fm/task-x1 vs local main) ---
+    * f58ae1b add feature
+    | * f27dbd5 rebased: add feature.txt
+    | * 1938898 unrelated main commit
+    |/  
+    * b605b30 origin baseline
+    [branch commits are NOT reachable from main - rebase rewrote them]
+
+=========================================================
+$ fm-teardown.sh task-x1
+=========================================================
+teardown task-x1 complete (window firstmate:fm-task-x1, worktree /var/folders/62/t6ydhgg91f3df0jm3k2r0fh80000gp/T//fm-teardown-tests.9rGZet/evid-landed-rebase/wt)
+Backlog: task-x1 just finished. Run tasks-axi done task-x1 --note "local main", then run tasks-axi ready for dependency-cleared candidates, check date gates, and dispatch only work whose blockers are gone and date is due.
+
+[exit status: 0]
+
+=========================================================
+$ SCENARIO 2: a second commit's patch never landed on main -> expect REFUSE
+=========================================================
+
+--- git state (branch fm/task-x1 vs local main) ---
+    * e1ea9f4 add extra
+    * a41a0b4 add feature
+    | * d25998e rebased: add feature.txt
+    | * dda8f3e unrelated main commit
+    |/  
+    * fb1bf79 origin baseline
+    [branch commits are NOT reachable from main - rebase rewrote them]
+
+=========================================================
+$ fm-teardown.sh task-x1
+=========================================================
+REFUSED: local-only worktree /var/folders/62/t6ydhgg91f3df0jm3k2r0fh80000gp/T//fm-teardown-tests.9rGZet/evid-unlanded-commit/wt has work not yet merged into main and not on any remote.
+commits not yet on main:
+e1ea9f4 add extra
+a41a0b4 add feature
+Merge the branch into local main first (bin/fm-merge-local.sh after the captain approves), or push to a fork/remote, or get the captain's explicit OK to discard, then --force.
+
+[exit status: 1]
+
+=========================================================
+$ SCENARIO 3: every commit landed but the worktree is dirty -> expect REFUSE
+=========================================================
+
+--- git state (branch fm/task-x1 vs local main) ---
+    * a1dd054 rebased: add feature.txt
+    * 61469b2 unrelated main commit
+    | * 0386f38 add feature
+    |/  
+    * cec1200 origin baseline
+    [branch commits are NOT reachable from main - rebase rewrote them]
+
+=========================================================
+$ fm-teardown.sh task-x1
+=========================================================
+REFUSED: local-only worktree /var/folders/62/t6ydhgg91f3df0jm3k2r0fh80000gp/T//fm-teardown-tests.9rGZet/evid-dirty/wt has uncommitted changes; its commits already landed in main.
+uncommitted changes present
+Commit the uncommitted changes (or get the captain's explicit OK to discard, then --force).
+
+[exit status: 1]
