@@ -1514,11 +1514,11 @@ test_squash_merged_branch_deleted_allows() {
   local case_dir rc pr_head
   case_dir=$(make_case squash-merged)
   write_meta "$case_dir" no-mistakes ship
-  # Real branch content that is NOT pushed and NOT on origin/main: a squash merge
-  # rewrote it into a different commit on main and auto-deleted the head branch, so
-  # HEAD is unreachable from every remote-tracking branch. The matching merged PR is
-  # the only signal that the work landed.
+  # A squash merge rewrote the commit on main and deleted the head branch, so HEAD
+  # is unreachable from every remote-tracking branch while its content remains in
+  # the current default branch.
   wt_commit_file "$case_dir" feature.txt hello "add feature"
+  land_on_origin_main "$case_dir" feature.txt hello
   append_pr_meta_for_current_head "$case_dir"
   pr_head=$(git -C "$case_dir/wt" rev-parse HEAD)
   add_gh_pr_merged_for_head "$case_dir" "$pr_head"
@@ -1541,6 +1541,7 @@ test_squash_merged_pr_allows_when_head_ancestor_of_pr_head() {
   append_pr_meta_url "$case_dir"
   local_head=$(git -C "$case_dir/wt" rev-parse HEAD)
   pr_head=$(commit_tree_from_wt_head "$case_dir" "$local_head" "no-mistakes follow-up")
+  land_on_origin_main "$case_dir" feature.txt hello
   add_gh_pr_merged_for_head "$case_dir" "$pr_head"
 
   set +e
@@ -1596,6 +1597,7 @@ test_squash_merged_pr_allows_replayed_unpushed_patch() {
   wt_commit_file "$case_dir" feature.txt hello "add feature"
   append_pr_meta_url "$case_dir"
   pr_head=$(land_equivalent_patch_on_origin_branch "$case_dir" pr-head feature.txt hello "add feature")
+  land_on_origin_main "$case_dir" feature.txt hello
   add_gh_pr_merged_for_head "$case_dir" "$pr_head"
 
   set +e
@@ -1608,15 +1610,12 @@ test_squash_merged_pr_allows_replayed_unpushed_patch() {
   pass "squash-merged PR accepts replayed unpushed local patches contained in the PR head"
 }
 
-test_merged_pr_head_evolved_after_local_commit_allows() {
+test_merged_pr_head_evolved_after_local_commit_refuses() {
   local case_dir rc parent_head pr_head tmp
   case_dir=$(make_case pr-head-evolved)
   write_meta "$case_dir" no-mistakes ship
-  # The merged-PR path is patch-id containment only, deliberately: the pipeline
-  # replays the local commit onto the PR branch and then keeps fixing it there,
-  # so the PR head's tree no longer holds the local change verbatim even though
-  # the work genuinely landed. Requiring the local change to still be present in
-  # the PR head's tree would false-refuse this.
+  # The PR first takes the local change, then replaces it, while origin/main never
+  # gains the original change.
   wt_commit_file "$case_dir" local-parent.txt parent "local parent"
   parent_head=$(git -C "$case_dir/wt" rev-parse HEAD)
   git -C "$case_dir/wt" push -q origin "$parent_head:refs/heads/fm/task-x1"
@@ -1644,9 +1643,9 @@ test_merged_pr_head_evolved_after_local_commit_allows() {
   rc=$?
   set -e
 
-  expect_code 0 "$rc" "pr-head-evolved: teardown should succeed when the merged PR head evolved past the local commit"
-  ! grep -q REFUSED "$case_dir/stderr" || fail "pr-head-evolved: teardown printed a REFUSED line"
-  pass "merged-PR path stays patch-id containment when the PR head evolved after the local commit"
+  expect_code 1 "$rc" "pr-head-evolved: teardown should refuse when the merged PR later replaces the local change"
+  grep -q REFUSED "$case_dir/stderr" || fail "pr-head-evolved: no REFUSED line in stderr"
+  pass "merged-PR containment refuses when the current default branch lacks the local change"
 }
 
 test_merged_pr_with_later_local_commit_refuses() {
@@ -3494,7 +3493,7 @@ test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows
 test_squash_merged_pr_allows_replayed_unpushed_patch
-test_merged_pr_head_evolved_after_local_commit_allows
+test_merged_pr_head_evolved_after_local_commit_refuses
 test_merged_pr_with_later_local_commit_refuses
 test_pr_check_does_not_refresh_stale_pr_head
 test_pr_check_records_remote_head_when_local_lags

@@ -8,26 +8,14 @@
 # hard-resets/removes the worktree and kills its processes. Work has landed when it is
 # reachable from any remote-tracking branch (a fork counts as a remote, so
 # upstream-contribution PRs pushed to a fork satisfy this in any mode), OR - for a
-# normal ship task whose commits are not so reachable - when its PR is merged and
-# GitHub reports a PR head that contains the current local work, its content is
-# already present in the up-to-date default branch, or every commit that branch
-# cannot reach is already present there as a PATCH that branch has not since
-# reverted. This recognizes the common
+# normal ship task whose commits are not so reachable - when the current local
+# work is represented in the up-to-date default branch. A merged PR whose head
+# contains that work is historical evidence, but never substitutes for the
+# current default-branch proof. The content and patch checks recognize the common
 # squash-merge-then-delete-branch flow, where the branch's own commits live nowhere
 # on a remote yet the change is fully in main, and the rebase case, where landing
 # rewrote every commit so no reachability test can ever succeed again (see
 # patches_are_in_ref).
-# The merged-PR path and the default-branch patch path deliberately DIFFER, and a
-# future reader must not "unify" them.
-# The merged-PR path is patch-id containment only: every unpushed commit's patch
-# must appear in the PR head, and that is the whole test.
-# That path is already anchored by a merged PR, whose head is expected to keep
-# evolving past the local commits under review fixes and rewrites, so demanding
-# the local change still be present verbatim in the PR head's tree would refuse
-# work that genuinely landed.
-# The default-branch patch path additionally requires the tree-representation
-# proof, because nothing else there rules out a patch that landed and was then
-# reverted, partially reverted, relocated, or replaced.
 # The PR itself is resolved from the task's recorded pr= when present, or - when
 # no pr= was ever recorded (e.g. a yolo-authorized merge on a repo with no PR CI,
 # where the usual "checks green" fm-pr-check.sh trigger never fires) - by looking
@@ -1277,21 +1265,16 @@ EOF
 }
 
 # The one patch-set comparison behind every landed-work patch check, so a future
-# fix to it can never land on only one copy. Takes the proof mode
-# (`patch-ids-only` or `with-tree-proof`), the reference tree the tree proof runs
-# against, the reference-side `git log` arguments, the literal separator `::`,
-# then the subject-side ones. Returns 0 when EVERY subject commit's patch
-# appeared on the reference side and - under `with-tree-proof` only - every
-# changed path remains represented in that reference tree, 2 when the subject
-# side is empty so there is nothing to prove (the caller decides what that
-# means), and 1 for everything
-# else: an unreadable git log, a subject side that touches no path, a reference
-# side that contributes no patch ids at all, an empty or unreadable subject patch
-# id, any subject commit whose patch is missing, or - under `with-tree-proof` -
-# any subject path whose change is no longer represented in the current reference
-# tree.
-# The two modes differ deliberately: see the merged-PR contract in this file's
-# header comment before unifying them.
+# fix to it can never land on only one copy. Takes the reference tree the proof
+# runs against, the reference-side `git log` arguments, the literal separator
+# `::`, then the subject-side ones. Returns 0 when EVERY subject commit's patch
+# appeared on the reference side and every changed path remains represented in
+# that reference tree, 2 when the subject side is empty so there is nothing to
+# prove (the caller decides what that means), and 1 for everything else: an
+# unreadable git log, a subject side that touches no path, a reference side that
+# contributes no patch ids at all, an empty or unreadable subject patch id, any
+# subject commit whose patch is missing, or any subject path whose change is no
+# longer represented in the current reference tree.
 # The reference scan is bounded to the paths the subject commits touch: a commit
 # can only carry a subject commit's patch if it touches exactly those paths, so
 # this can never drop a match, and it keeps unrelated default-branch history out
@@ -1299,16 +1282,10 @@ EOF
 # commit that did touch them.
 subject_patches_are_in_reference() {
   local -a ref_args=() subject_args=() pathspecs=()
-  local mode=$1 reference_tree=$2 past_separator=0 arg ref_ids subject_commits subject_paths commit patch_id path status
+  local reference_tree=$1 past_separator=0 arg ref_ids subject_commits subject_paths commit patch_id path status
   local subject_tip='' subject_oldest='' subject_base
-  shift 2
-  case "$mode" in
-    patch-ids-only|with-tree-proof) ;;
-    *) return 1 ;;
-  esac
-  if [ "$mode" = with-tree-proof ]; then
-    git -C "$WT" rev-parse --verify "$reference_tree^{tree}" >/dev/null 2>&1 || return 1
-  fi
+  shift
+  git -C "$WT" rev-parse --verify "$reference_tree^{tree}" >/dev/null 2>&1 || return 1
   for arg in "$@"; do
     if [ "$past_separator" = 0 ] && [ "$arg" = '::' ]; then
       past_separator=1
@@ -1344,7 +1321,6 @@ EOF
   done <<EOF
 $subject_commits
 EOF
-  [ "$mode" = with-tree-proof ] || return 0
   [ -n "$subject_tip" ] && [ -n "$subject_oldest" ] || return 1
   subject_base=$(git -C "$WT" rev-parse --verify "$subject_oldest^" 2>/dev/null) || return 1
   # A subject range with an empty NET diff (a change and its revert both inside
@@ -1367,21 +1343,10 @@ EOF
   changes_are_represented_in_tree "$subject_base" "$subject_tip" "$reference_tree"
 }
 
-# Patch-id containment against a merged PR's head, and nothing more: see the
-# merged-PR contract in this file's header comment for why this path deliberately
-# skips the tree-representation proof that patches_are_in_ref requires.
-unpushed_patches_are_in_pr_head() {
-  local pr_head=$1 current base
-  current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
-  base=$(git -C "$WT" merge-base "$current" "$pr_head" 2>/dev/null) || return 1
-  subject_patches_are_in_reference patch-ids-only "$pr_head" "$base..$pr_head" :: HEAD --not --remotes
-}
-
-# Is the worktree's PR merged for local work contained in that PR? Resolves the
-# PR from the recorded pr= URL first, then from the branch name, and asks GitHub
-# for both the PR state and head. Returns non-zero when the PR is not merged, the
-# current work is not contained in the PR head, no PR is found, or any gh error
-# occurs - the caller then falls back to the content check.
+# Is the worktree's PR merged with its current local work contained in the PR
+# head? Resolves the PR from the recorded pr= URL first, then from the branch
+# name. Returns non-zero when the PR is not merged, its head does not contain the
+# current work, no PR is found, or any gh error occurs.
 pr_is_merged() {
   local branch=$1 target view state head current
   if [ -n "$PR_URL" ]; then
@@ -1401,8 +1366,7 @@ pr_is_merged() {
   [ -n "$head" ] || return 1
   ensure_commit_object "$target" "$head" || return 1
   current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
-  git -C "$WT" merge-base --is-ancestor "$current" "$head" 2>/dev/null && return 0
-  unpushed_patches_are_in_pr_head "$head"
+  git -C "$WT" merge-base --is-ancestor "$current" "$head" 2>/dev/null
 }
 
 # The up-to-date default-branch ref to test landing against: origin's
@@ -1454,23 +1418,29 @@ content_in_ref() {
 patches_are_in_ref() {
   local ref=$1 status
   [ -n "$ref" ] || return 1
-  subject_patches_are_in_reference with-tree-proof "$ref" "$ref" --not HEAD :: HEAD --not "$ref"
+  subject_patches_are_in_reference "$ref" "$ref" --not HEAD :: HEAD --not "$ref"
   status=$?
   [ "$status" -eq 0 ] || [ "$status" -eq 2 ]
 }
 
 # Has the worktree's committed work actually LANDED, though its commits are not
-# reachable from any remote-tracking branch? True when a merged PR proves the
-# current local work is contained in the PR head, OR the content is already in the
-# default branch, OR every commit the default branch cannot reach is already there
-# as a patch (the rebase case). The two default-branch fallbacks also cover the
-# no-PR and gh-error paths. False only for genuinely unlanded work.
+# reachable from any remote-tracking branch? A merged PR records historical
+# containment, but every allow path requires the current default branch's content
+# or patch-and-tree proof. The default-branch checks also cover the no-PR and
+# gh-error paths. False only for genuinely unlanded work.
+current_default_ref_proves_work() {
+  local ref=$1
+  content_in_ref "$ref" || patches_are_in_ref "$ref"
+}
+
 work_is_landed() {
   local branch=$1 ref
-  pr_is_merged "$branch" && return 0
   ref=$(default_landing_ref) || return 1
-  content_in_ref "$ref" && return 0
-  patches_are_in_ref "$ref"
+  if pr_is_merged "$branch"; then
+    current_default_ref_proves_work "$ref"
+    return $?
+  fi
+  current_default_ref_proves_work "$ref"
 }
 
 backlog_refresh_reminder() {
