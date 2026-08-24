@@ -1119,6 +1119,33 @@ changes_are_represented_in_tree_fail() {
   return 1
 }
 
+# The tree-representation proof behind `with-tree-proof`: is the whole
+# <pre>..<post> change still present in <tree>, at the place it landed?
+# A patch id alone cannot answer that, because a patch that landed and was then
+# reverted, partially reverted, relocated, or replaced still has its id on the
+# reference side forever.
+# Each changed path is proven on its own, by reverse-applying that path's patch
+# against a scratch index holding <tree>: reverse-apply succeeds only if <tree>
+# still contains the exact post-image lines the patch added.
+# The proof is deliberately strict in three ways a future simplification must not
+# relax.
+# It is location-preserving: `git apply` reports `Hunk #N succeeded at <line>`
+# whenever it matched at an offset, so any such line means the block was found
+# somewhere other than where it landed and the path is NOT represented (LC_ALL=C
+# pins that message to the text matched here).
+# It is terminator-aware: the per-path patch carries its `\ No newline at end of
+# file` markers and, under --binary --full-index, a literal delta for a binary
+# path, so a difference of only a trailing terminator fails the reverse-apply
+# instead of being normalized away.
+# It only ever allows on positive proof: an unreadable or empty per-path patch,
+# an unreadable scratch index, and every unexpected git failure all report "not
+# represented".
+# The one fallback arm, taken when reverse-apply fails, covers the genuine
+# superset case where <tree> kept the landed file and added unrelated lines on
+# top of it: it requires the path to be newly added by the change (absent in
+# <pre>), present as the same kind of regular blob in <post> and <tree>, textual
+# on both sides, and to have gained lines only - a single deleted line means part
+# of the landed content is gone, so it refuses.
 changes_are_represented_in_tree() {
   local pre=$1 post=$2 tree=$3 paths path tmp status pre_entry post_entry current_entry
   local post_meta current_meta post_mode post_type post_oid current_mode current_type current_oid
@@ -1320,6 +1347,13 @@ EOF
   [ "$mode" = with-tree-proof ] || return 0
   [ -n "$subject_tip" ] && [ -n "$subject_oldest" ] || return 1
   subject_base=$(git -C "$WT" rev-parse --verify "$subject_oldest^" 2>/dev/null) || return 1
+  # A subject range with an empty NET diff (a change and its revert both inside
+  # the range) has no changed path to run the per-path proof over.
+  # It is allowed only here, after the loop above already proved every subject
+  # patch - both inverse patches included - present on the reference side, and
+  # only when the reference tree still matches the subject tip over exactly those
+  # paths, so the sequence is never inferred to have landed from the empty net
+  # diff alone.
   git -C "$WT" diff --quiet --no-ext-diff --no-renames "$subject_base" "$subject_tip" -- 2>/dev/null
   status=$?
   if [ "$status" -eq 0 ]; then
