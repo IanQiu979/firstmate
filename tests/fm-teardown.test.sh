@@ -1597,6 +1597,10 @@ test_squash_merged_pr_allows_replayed_unpushed_patch() {
   wt_commit_file "$case_dir" feature.txt hello "add feature"
   append_pr_meta_url "$case_dir"
   pr_head=$(land_equivalent_patch_on_origin_branch "$case_dir" pr-head feature.txt hello "add feature")
+  # The merged PR's parent commit is part of the current local tree too, so the
+  # default branch must carry it before the current-tree proof may authorize
+  # teardown.
+  land_on_origin_main "$case_dir" local-parent.txt parent
   land_on_origin_main "$case_dir" feature.txt hello
   add_gh_pr_merged_for_head "$case_dir" "$pr_head"
 
