@@ -176,6 +176,10 @@
 # resolver because `cursor` is not the CLI name. A cursor SECONDMATE instead runs
 # the tracked project-scope .cursor/hooks.json in its own home, whose stop-hook
 # park owns that home's supervision (docs/supervision-protocols/cursor.md).
+# A fresh ship/scout spawn or relaunch refuses when its harness is already at
+# its configured concurrency cap (config/harness-concurrency-limit, default 3;
+# docs/configuration.md "Per-harness concurrency cap" owns the contract).
+# Secondmates are exempt. bin/fm-harness-concurrency-lib.sh owns the check.
 # On success prints: spawned <id> harness=<name> kind=<ship|scout|secondmate> [mode=<mode> yolo=<on|off>] window=<backend-target> worktree=<path>
 # A ship task records the explicit mode/yolo it was passed; a secondmate spawn records
 # mode=secondmate, yolo=off, home=, and projects=; a scout records neither, and both the
@@ -246,6 +250,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-harness-concurrency-lib.sh
+. "$SCRIPT_DIR/fm-harness-concurrency-lib.sh"
 # shellcheck source=bin/fm-control-lib.sh
 . "$SCRIPT_DIR/fm-control-lib.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
@@ -1257,6 +1263,21 @@ case "$HARNESS" in
     fi
     ;;
 esac
+
+# Per-harness concurrency cap (AGENTS.md; the captain's own feature request):
+# no more than a configured number of LIVE agents on this harness at a time,
+# counted across every project and task in this home. Secondmates are exempt;
+# fm_harness_live_holders' header owns that and every other counting decision.
+# Checked here - HARNESS is final and nothing has been allocated yet - so a
+# refusal leaves no worktree, metadata, or backend session behind. A relaunch
+# is checked exactly like a fresh spawn because it starts a new live process
+# too; a fresh ship/scout spawn is already fully serialized per-home by
+# SPAWN_TASK_SET_LOCK above, so only relaunch-vs-relaunch on the same harness
+# has a narrow best-effort (unlocked) check-then-launch window, judged too
+# rare a recovery-path race to justify a dedicated cross-process lock.
+if [ "$KIND" != secondmate ]; then
+  fm_harness_concurrency_check "$STATE" "$CONFIG" "$HARNESS" "$ID" || exit 1
+fi
 
 # config/secondmate-harness may carry optional model/effort tokens alongside the
 # harness ("<harness> [<model>] [<effort>]"). They apply only when this is a
