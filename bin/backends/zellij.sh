@@ -286,6 +286,32 @@ fm_backend_zellij_pane_exists() {  # <session> <pane_id>
     | jq -e --argjson p "$pane_id" '[.[]? | select(.id == $p and .is_plugin == false)] | length > 0' >/dev/null 2>&1
 }
 
+fm_backend_zellij_agent_state() {  # <target>
+  local panes count
+  fm_backend_zellij_parse_target "$1" || { printf 'unreadable'; return 0; }
+  if ! zellij list-sessions --short --no-formatting >/dev/null 2>&1; then
+    printf 'unreadable'
+    return 0
+  fi
+  if ! fm_backend_zellij_session_exists "$FM_BACKEND_ZELLIJ_SESSION"; then
+    printf 'missing'
+    return 0
+  fi
+  panes=$(fm_backend_zellij_cli "$FM_BACKEND_ZELLIJ_SESSION" action list-panes --json 2>/dev/null) || {
+    printf 'unreadable'
+    return 0
+  }
+  count=$(printf '%s' "$panes" | jq -r --argjson p "$FM_BACKEND_ZELLIJ_PANE" '[.[]? | select(.id == $p and .is_plugin == false)] | length' 2>/dev/null) || {
+    printf 'unreadable'
+    return 0
+  }
+  case "$count" in
+    0) printf 'missing' ;;
+    1) printf 'unverified' ;;
+    *) printf 'unreadable' ;;
+  esac
+}
+
 # fm_backend_zellij_tab_matches_label: does <tab_id> in <session> carry the
 # tab name firstmate expects for the caller-facing task label <label>?
 # Checks the home-scoped, tagged title first (fm_backend_zellij_scoped_title

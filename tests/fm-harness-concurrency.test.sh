@@ -25,6 +25,7 @@ SLEEP_BIN=$(command -v sleep) || { echo "skip: sleep not found"; exit 0; }
 SPAWN="$ROOT/bin/fm-spawn.sh"
 LIB="$ROOT/bin/fm-harness-concurrency-lib.sh"
 BACKEND_LIB="$ROOT/bin/fm-backend.sh"
+WAKE_LIB="$ROOT/bin/fm-wake-lib.sh"
 REAL_TMUX=$(command -v tmux)
 SOCKET="fm-hconc-$$"
 TMP_ROOT=$(fm_test_tmproot fm-harness-concurrency)
@@ -52,6 +53,8 @@ export PATH
 ln -s "$SLEEP_BIN" "$LAB/bin/claude-link"
 ln -s "$SLEEP_BIN" "$LAB/bin/codex-link"
 
+# shellcheck source=/dev/null
+. "$WAKE_LIB"
 # shellcheck source=/dev/null
 . "$BACKEND_LIB"
 fm_backend_source tmux || fail "fm_backend_source tmux failed"
@@ -258,6 +261,77 @@ test_dead_and_missing_endpoints_do_not_hold_slots() {
   pass "dead/missing endpoints: 3 stale claude records do not block a fresh spawn"
 }
 
+test_concurrent_admission_publishes_only_one_final_slot() {
+  local home id1 id2 result_a result_b success_count
+  home=$(new_home concurrent-admission)
+  id1=hc-concurrent-a-q1
+  id2=hc-concurrent-b-q2
+  new_alive_window "hc-concurrent-1" claude-link
+  new_alive_window "hc-concurrent-2" claude-link
+  wait_for_alive "$SESSION:hc-concurrent-1" || fail "fixture window hc-concurrent-1 never went alive"
+  wait_for_alive "$SESSION:hc-concurrent-2" || fail "fixture window hc-concurrent-2 never went alive"
+  fm_write_meta "$home/state/hc-concurrent-existing-a-q1.meta" "window=$SESSION:hc-concurrent-1" "harness=claude" "kind=ship"
+  fm_write_meta "$home/state/hc-concurrent-existing-b-q2.meta" "window=$SESSION:hc-concurrent-2" "harness=claude" "kind=ship"
+
+  admission_worker() {
+    local id=$1 endpoint=$2 lock
+    lock=$(fm_harness_concurrency_admission_lock_path "$home/state" claude) || return 1
+    fm_lock_acquire_wait "$lock" || return 1
+    if fm_harness_concurrency_check "$home/state" "$home/config" claude; then
+      fm_write_meta "$home/state/$id.meta" "window=$endpoint" "harness=claude" "kind=ship"
+      fm_lock_release "$lock"
+      return 0
+    fi
+    fm_lock_release "$lock"
+    return 1
+  }
+
+  admission_worker "$id1" "$SESSION:hc-concurrent-1" >"$home/a.out" 2>&1 &
+  local pid_a=$!
+  admission_worker "$id2" "$SESSION:hc-concurrent-2" >"$home/b.out" 2>&1 &
+  local pid_b=$!
+  wait "$pid_a" && result_a=success || result_a=refused
+  wait "$pid_b" && result_b=success || result_b=refused
+  success_count=0
+  [ "$result_a" = success ] && success_count=$((success_count + 1))
+  [ "$result_b" = success ] && success_count=$((success_count + 1))
+  [ "$success_count" -eq 1 ] || fail "two simultaneous admissions with two live holders must publish exactly one final slot"
+  [ "$(fm_harness_live_holders "$home/state" claude | wc -l | tr -d ' ')" -eq 3 ] \
+    || fail "atomic admission must leave exactly three live claude slots"
+  pass "concurrent admission: two contenders at 2/3 publish exactly one final slot"
+}
+
+test_missing_zellij_endpoint_does_not_hold_slot() {
+  local home fake_zellij old_path holders
+  home=$(new_home zellij-missing)
+  fake_zellij="$home/zellij"
+  old_path=$PATH
+  cat > "$fake_zellij" <<'SH'
+#!/usr/bin/env bash
+if [ "$1" = list-sessions ]; then
+  printf 'zellij-fixture\n'
+  exit 0
+fi
+if [ "$1" = --session ] && [ "$3" = action ] && [ "$4" = list-panes ] && [ "$5" = --json ]; then
+  printf '[]\n'
+  exit 0
+fi
+exit 1
+SH
+  chmod +x "$fake_zellij"
+  PATH="$home:$PATH"
+  export PATH
+  fm_write_meta "$home/state/hc-zellij-stale-q1.meta" \
+    "window=zellij-fixture:99" "backend=zellij" "harness=claude" "kind=ship"
+  [ "$(fm_backend_agent_state zellij zellij-fixture:99)" = missing ] \
+    || fail "a readable Zellij session lacking the recorded pane must be missing"
+  holders=$(fm_harness_live_holders "$home/state" claude)
+  [ -z "$holders" ] || fail "a missing Zellij endpoint must not hold a harness slot"
+  PATH=$old_path
+  export PATH
+  pass "missing Zellij endpoint: a stale record does not hold a concurrency slot"
+}
+
 # --- secondmates are excluded from the count ---------------------------------
 
 test_secondmates_are_excluded() {
@@ -288,6 +362,8 @@ test_at_cap_refuses_and_names_holders
 test_over_cap_reports_correctly
 test_mixed_harnesses_are_independent
 test_dead_and_missing_endpoints_do_not_hold_slots
+test_concurrent_admission_publishes_only_one_final_slot
+test_missing_zellij_endpoint_does_not_hold_slot
 test_secondmates_are_excluded
 
 echo "# all fm-harness-concurrency tests passed"

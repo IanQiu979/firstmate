@@ -18,6 +18,14 @@
 FM_HARNESS_CONCURRENCY_LIMIT_DEFAULT=3
 FM_HARNESS_CONCURRENCY_LIMIT_FILE="harness-concurrency-limit"
 
+fm_harness_concurrency_admission_lock_path() {  # <state-dir> <harness>
+  local state=$1 harness=$2
+  [ -n "$state" ] || return 1
+  case "$state" in *[$'\n\r\t']*) return 1 ;; esac
+  case "$harness" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  printf '%s/.harness-admission-%s.lock\n' "$state" "$harness"
+}
+
 # fm_harness_concurrency_limit: print the effective per-harness cap.
 # config/harness-concurrency-limit is a local, gitignored file (see
 # docs/configuration.md "Per-harness concurrency cap") holding one positive

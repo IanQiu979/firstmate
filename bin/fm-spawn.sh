@@ -671,6 +671,8 @@ SPAWN_META_LOCK_HELD=0
 SPAWN_META_PUBLISH_STARTED=0
 SPAWN_TASK_SET_LOCK=
 SPAWN_TASK_SET_LOCK_HELD=0
+HARNESS_ADMISSION_LOCK=
+HARNESS_ADMISSION_LOCK_HELD=0
 RELAUNCH_REPLACEMENT_PENDING=0
 RELAUNCH_REPLACEMENT_BUSY_GEN=
 RELAUNCH_REPLACEMENT_HARNESS=
@@ -779,6 +781,10 @@ spawn_abort_cleanup() {
   if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
     SPAWN_TASK_SET_LOCK_HELD=0
     fm_lock_release "$SPAWN_TASK_SET_LOCK" || true
+  fi
+  if [ "$HARNESS_ADMISSION_LOCK_HELD" = 1 ]; then
+    HARNESS_ADMISSION_LOCK_HELD=0
+    fm_lock_release "$HARNESS_ADMISSION_LOCK" || true
   fi
   if [ "$SPAWN_CONTROL_LOCK_HELD" = 1 ]; then
     SPAWN_CONTROL_LOCK_HELD=0
@@ -1269,13 +1275,14 @@ esac
 # counted across every project and task in this home. Secondmates are exempt;
 # fm_harness_live_holders' header owns that and every other counting decision.
 # Checked here - HARNESS is final and nothing has been allocated yet - so a
-# refusal leaves no worktree, metadata, or backend session behind. A relaunch
-# is checked exactly like a fresh spawn because it starts a new live process
-# too; a fresh ship/scout spawn is already fully serialized per-home by
-# SPAWN_TASK_SET_LOCK above, so only relaunch-vs-relaunch on the same harness
-# has a narrow best-effort (unlocked) check-then-launch window, judged too
-# rare a recovery-path race to justify a dedicated cross-process lock.
+# refusal leaves no worktree, metadata, or backend session behind.
 if [ "$KIND" != secondmate ]; then
+  HARNESS_ADMISSION_LOCK=$(fm_harness_concurrency_admission_lock_path "$STATE" "$HARNESS") || {
+    echo "error: could not resolve the harness admission lock for '$HARNESS'" >&2
+    exit 1
+  }
+  fm_lock_acquire_wait "$HARNESS_ADMISSION_LOCK"
+  HARNESS_ADMISSION_LOCK_HELD=1
   fm_harness_concurrency_check "$STATE" "$CONFIG" "$HARNESS" "$ID" || exit 1
 fi
 
@@ -2723,6 +2730,10 @@ if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
   # publication.
   SPAWN_TASK_SET_LOCK_HELD=0
   fm_lock_release "$SPAWN_TASK_SET_LOCK"
+fi
+if [ "$HARNESS_ADMISSION_LOCK_HELD" = 1 ]; then
+  HARNESS_ADMISSION_LOCK_HELD=0
+  fm_lock_release "$HARNESS_ADMISSION_LOCK"
 fi
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 
