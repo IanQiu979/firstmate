@@ -1,0 +1,43 @@
+SCENARIO: rewritten commit with the identical current patch on main
+RESULT: exit=0; task-record=removed
+STDOUT:
+teardown task-x1 complete (window firstmate:fm-task-x1, worktree /var/folders/62/t6ydhgg91f3df0jm3k2r0fh80000gp/T//fm-teardown-tests.YtJu7I/evidence-rebased-allow/wt)
+Backlog: task-x1 just finished. Run tasks-axi done task-x1 --note "local main", then run tasks-axi ready for dependency-cleared candidates, check date gates, and dispatch only work whose blockers are gone and date is due.
+STDERR:
+●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+●  WATCHER DOWN - SUPERVISION IS OFF
+●  1 task(s) in flight, but no live watcher process holds this home lock (last beat: 1s ago).
+●  Trust the emitted supervision protocol for this harness; do not use shell & for watcher repair.
+●  This is a supervision warning only; the guarded operation WILL still run.
+●  repair missing watcher supervision according to the session-start block for this harness; do not use shell &.
+●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SCENARIO: one rewritten patch landed but a second patch is absent from main
+RESULT: exit=1; task-record=retained; unlanded-file=retained
+STDERR:
+●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+●  WATCHER DOWN - SUPERVISION IS OFF
+●  1 task(s) in flight, but no live watcher process holds this home lock (last beat: 0s ago).
+●  Trust the emitted supervision protocol for this harness; do not use shell & for watcher repair.
+●  This is a supervision warning only; the guarded operation WILL still run.
+●  repair missing watcher supervision according to the session-start block for this harness; do not use shell &.
+●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REFUSED: local-only worktree /var/folders/62/t6ydhgg91f3df0jm3k2r0fh80000gp/T//fm-teardown-tests.YtJu7I/evidence-unlanded-refuse/wt has work not yet merged into main and not on any remote.
+commits not yet on main:
+61afd4d add extra
+6f7bd00 add feature
+Merge the branch into local main first (bin/fm-merge-local.sh after the captain approves), or push to a fork/remote, or get the captain's explicit OK to discard, then --force.
+
+SCENARIO: every committed patch landed, but the worktree has a staged local file
+RESULT: exit=1; task-record=retained; dirty-file=retained
+STDERR:
+●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+●  WATCHER DOWN - SUPERVISION IS OFF
+●  1 task(s) in flight, but no live watcher process holds this home lock (last beat: 1s ago).
+●  Trust the emitted supervision protocol for this harness; do not use shell & for watcher repair.
+●  This is a supervision warning only; the guarded operation WILL still run.
+●  repair missing watcher supervision according to the session-start block for this harness; do not use shell &.
+●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REFUSED: local-only worktree /var/folders/62/t6ydhgg91f3df0jm3k2r0fh80000gp/T//fm-teardown-tests.YtJu7I/evidence-dirty-refuse/wt has uncommitted changes; its commits already landed in main.
+uncommitted changes present
+Commit the uncommitted changes (or get the captain's explicit OK to discard, then --force).

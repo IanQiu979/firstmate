@@ -1,0 +1,2 @@
+ok - squash-merged PR accepts replayed unpushed local patches contained in the PR head
+ok - merged-PR containment refuses when the current default branch lacks the local change
