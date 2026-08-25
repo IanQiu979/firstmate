@@ -25,6 +25,11 @@
 #       This is the direct regression pair for the 2026-07-02 herdr incident,
 #       proving the watcher's own absorb-only-when-provably-working predicate
 #       benefits from the fix in both directions.
+#   (l) a terminal (failed/cancelled) `axi status` answer that is a SUPERSEDED
+#       predecessor run must not shadow a newer, still-active run on the same
+#       branch - the newer run's state wins. Regression for the 2026-08-24
+#       false-teardown-readback incidents. A genuinely terminal run with
+#       nothing newer in the runs list is unaffected.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -288,6 +293,19 @@ run:
   pr: ""
   findings: none
 outcome: failed
+EOF
+}
+
+run_cancelled() {  # <branch>
+  cat <<EOF
+run:
+  id: "01RUN"
+  branch: $1
+  status: completed
+  head: "${FM_FAKE_RUN_HEAD:-abc1234}"
+  pr: ""
+  findings: none
+outcome: cancelled
 EOF
 }
 
@@ -682,6 +700,86 @@ test_terminal_failed() {
   assert_contains "$out" "state: failed" "failed run -> failed"
   assert_contains "$out" "source: run-step" "failed -> run-step source"
   pass "terminal failed run is authoritative"
+}
+
+# Regression for the 2026-08-24 false-teardown incidents: `axi status` (bare)
+# answered with a SUPERSEDED terminal predecessor run (same branch, head equal
+# to the worktree tip - a trivial match) while the authoritative newest-first
+# `no-mistakes runs` listing shows a NEWER run on that same branch still
+# actively validating, with fix commits already ahead of the worktree tip (the
+# same valid ancestor-match head as test_active_run_descendant_fix_head_remains_current).
+# The newer active run must win; the superseded terminal run must never
+# surface as the branch's current state.
+test_superseded_failed_run_not_authoritative_over_newer_active_run() {
+  reset_fakes
+  local d base_head fix_short base_short out
+  d=$(new_case superseded-failed)
+  make_repo_on_branch "$d/wt" fm/feat-superseded
+  base_head=$(git -C "$d/wt" rev-parse HEAD)
+  git -C "$d/wt" commit -q --allow-empty -m 'pipeline fix commit 1'
+  git -C "$d/wt" commit -q --allow-empty -m 'pipeline fix commit 2'
+  fix_short=$(git -C "$d/wt" rev-parse --short=7 HEAD)
+  git -C "$d/wt" reset -q --hard "$base_head"
+  base_short=$(git -C "$d/wt" rev-parse --short=7 HEAD)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/superseded-f.meta" "window=fm:fm-superseded-f" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_RUN_HEAD="$base_head"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-superseded)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/feat-superseded ${fix_short}  2026-08-24 21:50
+  failed     fm/feat-superseded ${base_short}  2026-08-24 20:00
+EOF
+)"
+  out=$(run_crew_state "$d" superseded-f)
+  assert_contains "$out" "state: working" "newer active run wins over a superseded terminal predecessor"
+  assert_contains "$out" "source: run-step" "superseded-run resolution stays run-step sourced"
+  assert_not_contains "$out" "state: failed" "superseded terminal predecessor must not surface as failed"
+  pass "a superseded failed run does not shadow a newer active run"
+}
+
+# Same scenario with a cancelled predecessor (the other terminal wording
+# observed in the 2026-08-24 incidents: "run cancelled").
+test_superseded_cancelled_run_not_authoritative_over_newer_active_run() {
+  reset_fakes
+  local d base_head fix_short base_short out
+  d=$(new_case superseded-cancelled)
+  make_repo_on_branch "$d/wt" fm/feat-superseded-c
+  base_head=$(git -C "$d/wt" rev-parse HEAD)
+  git -C "$d/wt" commit -q --allow-empty -m 'pipeline fix commit 1'
+  fix_short=$(git -C "$d/wt" rev-parse --short=7 HEAD)
+  git -C "$d/wt" reset -q --hard "$base_head"
+  base_short=$(git -C "$d/wt" rev-parse --short=7 HEAD)
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/superseded-c.meta" "window=fm:fm-superseded-c" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_RUN_HEAD="$base_head"
+  FM_FAKE_AXI_STATUS="$(run_cancelled fm/feat-superseded-c)"
+  FM_FAKE_RUNS_LIST="$(cat <<EOF
+  running    fm/feat-superseded-c ${fix_short}  2026-08-24 21:55
+  cancelled  fm/feat-superseded-c ${base_short}  2026-08-24 21:00
+EOF
+)"
+  out=$(run_crew_state "$d" superseded-c)
+  assert_contains "$out" "state: working" "newer active run wins over a superseded cancelled predecessor"
+  assert_contains "$out" "source: run-step" "superseded-run resolution stays run-step sourced"
+  assert_not_contains "$out" "state: failed" "superseded cancelled predecessor must not surface as failed"
+  pass "a superseded cancelled run does not shadow a newer active run"
+}
+
+# A genuinely terminal run (no newer run present anywhere in the runs list)
+# must still be authoritative - the cross-check must not soften a real
+# terminal outcome into anything else.
+test_terminal_failed_with_no_newer_run_stays_failed() {
+  reset_fakes
+  local d; d=$(new_case failed-no-newer)
+  make_repo_on_branch "$d/wt" fm/feat-e2
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-e2.meta" "window=fm:fm-feat-e2" "worktree=$d/wt" "kind=ship"
+  FM_FAKE_AXI_STATUS="$(run_failed fm/feat-e2)"
+  FM_FAKE_RUNS_LIST=""
+  local out; out=$(run_crew_state "$d" feat-e2)
+  assert_contains "$out" "state: failed" "genuinely terminal failed run with no newer run stays failed"
+  assert_contains "$out" "source: run-step" "genuinely terminal run stays run-step sourced"
+  pass "a genuinely terminal run with nothing newer is unaffected by the cross-check"
 }
 
 # (e) cross-branch attribution: `axi status` returns ANOTHER branch's run (the
@@ -1428,6 +1526,9 @@ test_top_level_fixing_ci_running_after_green_stays_working
 test_top_level_fixing_done_log_stays_working
 test_terminal_passed
 test_terminal_failed
+test_superseded_failed_run_not_authoritative_over_newer_active_run
+test_superseded_cancelled_run_not_authoritative_over_newer_active_run
+test_terminal_failed_with_no_newer_run_stays_failed
 test_cross_branch_attribution_via_runs_list
 test_cross_branch_attribution_picks_most_recent_row
 test_coarse_run_does_not_probe_other_branch_ci_log_for_ready_status
