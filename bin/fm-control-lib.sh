@@ -182,10 +182,12 @@ fm_control_backend_supports_key() {  # <backend> <key>
   return 1
 }
 
-# Whether <backend> has a recovery-grade agent-state classifier. Only tmux and
-# herdr implement fm_backend_agent_state; zellij, orca, and cmux report
-# `unverified`, so no reading of theirs can prove an agent stopped. The control
-# plane refuses a stop-proving verb there instead of reporting an unprovable
+# Whether <backend> has a recovery-grade agent-state classifier able to prove
+# an agent STOPPED (`dead`). Only tmux and herdr's fm_backend_agent_state can
+# return `dead`; zellij's classifier can authoritatively return `missing` (the
+# recorded pane is gone) but never `dead`, and orca and cmux report
+# `unverified`, so none of the three can prove a stop. The control plane
+# refuses a stop-proving verb there instead of reporting an unprovable
 # transition as success.
 fm_control_backend_state_verified() {  # <backend>
   case "${1-}" in
