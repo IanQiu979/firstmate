@@ -1434,12 +1434,8 @@ current_default_ref_proves_work() {
 }
 
 work_is_landed() {
-  local branch=$1 ref
+  local ref
   ref=$(default_landing_ref) || return 1
-  if pr_is_merged "$branch"; then
-    current_default_ref_proves_work "$ref"
-    return $?
-  fi
   current_default_ref_proves_work "$ref"
 }
 
