@@ -8,23 +8,30 @@
 # hard-resets/removes the worktree and kills its processes. Work has landed when it is
 # reachable from any remote-tracking branch (a fork counts as a remote, so
 # upstream-contribution PRs pushed to a fork satisfy this in any mode), OR - for a
-# normal ship task whose commits are not so reachable - when its PR is merged and
-# GitHub reports a PR head that contains the current local work, or its content is
-# already present in the up-to-date default branch. This recognizes the common
+# normal ship task whose commits are not so reachable - when the current local
+# work is represented in the up-to-date default branch. A merged PR whose head
+# contains that work is historical evidence, but never substitutes for the
+# current default-branch proof. The content and patch checks recognize the common
 # squash-merge-then-delete-branch flow, where the branch's own commits live nowhere
-# on a remote yet the change is fully in main.
+# on a remote yet the change is fully in main, and the rebase case, where landing
+# rewrote every commit so no reachability test can ever succeed again (see
+# patches_are_in_ref).
 # The PR itself is resolved from the task's recorded pr= when present, or - when
 # no pr= was ever recorded (e.g. a yolo-authorized merge on a repo with no PR CI,
 # where the usual "checks green" fm-pr-check.sh trigger never fires) - by looking
 # up a merged PR whose head branch matches the worktree's branch, fetching its head
 # via refs/pull/<n>/head when the branch itself was deleted. So a missing pr= never
 # by itself causes a false refusal of landed work.
-# A gh lookup error falls back to the content check; if that is also inconclusive,
-# teardown refuses rather than risk discarding unlanded work.
+# A gh lookup error falls back to the default-branch content and patch checks; if
+# those are also inconclusive, teardown refuses rather than risk discarding
+# unlanded work.
 # Uncommitted changes are never landed.
 # local-only projects additionally accept work merged into the local default
 # branch (firstmate performs that merge after configured approval) as a fallback
-# for the common case where there is no remote at all.
+# for the common case where there is no remote at all, by the same reachability-
+# or-patch test. That path matters most there: bin/fm-merge-local.sh is
+# fast-forward-only, so every chain landing into a moved default branch rebases
+# first and leaves its earlier nodes with rewritten commits.
 # Scout tasks (kind=scout in meta) carve out of that check: their worktree is
 # declared scratch and the report at data/<task-id>/report.md is the work
 # product. Teardown proceeds only once the report exists and the shared
@@ -50,8 +57,12 @@
 # is the approved discard path that prevalidates child removal targets, locks each
 # descendant home's task set before enumeration, and holds those locks through
 # child cleanup. Contention refuses the complete forced teardown before child
-# mutation. It then discards child work, kills child runtime endpoints, and removes
-# the retired home. Removing a leased home releases its durable treehouse lease so the pool slot is freed,
+# mutation. Local and remote retirement serialize their destructive phase with
+# that mate's backlog-handoff lock under the registry lock. Pending handoff wake
+# state is retired with the home, and local removal failure restores that state
+# before preserving the route for retry. Teardown then discards child work, kills
+# child runtime endpoints, and removes the retired home. Removing a leased home
+# releases its durable treehouse lease so the pool slot is freed,
 # never left leased forever. If the treehouse return fails, teardown leaves the
 # leased home and state in place instead of hiding a still-held lease.
 # Usage: fm-teardown.sh <task-id> [--force]
@@ -166,6 +177,8 @@ SUB_HOME_PARENT_MARKER=".fm-secondmate-parent"
 . "$SCRIPT_DIR/fm-secondmate-parent-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-pending-reply-lib.sh
+. "$SCRIPT_DIR/fm-pending-reply-lib.sh"
 # shellcheck source=bin/fm-nm-run-lib.sh
 . "$SCRIPT_DIR/fm-nm-run-lib.sh"
 if [ "$#" -lt 1 ] || ! fm_task_id_path_safe "$1"; then
@@ -176,6 +189,20 @@ ID=$1
 FORCE=${2:-}
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# Supervision lease guard: post-landing cleanup is overlap territory between
+# the two Pi supervision actors; refuse while the OTHER actor holds this
+# task's live lease (contract: bin/fm-lease-lib.sh; no-op in homes without
+# leases).
+# shellcheck source=bin/fm-lease-lib.sh
+. "$SCRIPT_DIR/fm-lease-lib.sh"
+# Role partition: forced teardown discards work, and the supervision branch
+# never discards anything - only an ordinary landed-work teardown is branch
+# territory (contract: bin/fm-lease-lib.sh).
+if [ "$FORCE" = --force ] && [ "$(fm_lease_actor)" = branch ]; then
+  echo "error: forced teardown refused - the supervision branch cannot discard work" >&2
+  exit "$FM_LEASE_REFUSE_EXIT"
+fi
+fm_lease_guard "$ID" "teardown (fm-teardown)"
 CONTROL_LOCK="$STATE/.control-$ID.lock"
 CONTROL_LOCK_HELD=0
 META_LOCK=
@@ -194,6 +221,18 @@ teardown_release_locks() {
     fm_lock_release "${DESCENDANT_LOCK_PATHS[$i]}" || true
   done
   DESCENDANT_LOCK_PATHS=()
+  if [ -n "${HANDOFF_WAKE_RETIRE_LOCK:-}" ]; then
+    fm_lock_release "$HANDOFF_WAKE_RETIRE_LOCK" || true
+    HANDOFF_WAKE_RETIRE_LOCK=
+  fi
+  if [ -n "${LOCAL_HANDOFF_LOCK:-}" ]; then
+    fm_lock_release "$LOCAL_HANDOFF_LOCK" || true
+    LOCAL_HANDOFF_LOCK=
+  fi
+  if [ -n "${LOCAL_REGISTRY_LOCK:-}" ]; then
+    fm_lock_release "$LOCAL_REGISTRY_LOCK" || true
+    LOCAL_REGISTRY_LOCK=
+  fi
   if [ "$META_LOCK_HELD" = 1 ]; then
     fm_lock_release "$META_LOCK" || true
     META_LOCK_HELD=0
@@ -202,6 +241,7 @@ teardown_release_locks() {
     fm_lock_release "$CONTROL_LOCK" || true
     CONTROL_LOCK_HELD=0
   fi
+  fm_lease_guard_release || true
   return "$status"
 }
 trap teardown_release_locks EXIT
@@ -230,6 +270,208 @@ REMOTE_PENDING_DIR_REAL=
 REMOTE_HANDOFF_LOCK=
 REMOTE_REGISTRY_LOCK=
 REMOTE_REPLY_LIFECYCLE_LOCK=
+LOCAL_HANDOFF_LOCK=
+LOCAL_REGISTRY_LOCK=
+HANDOFF_WAKE_RETIRE_MARKER=
+HANDOFF_WAKE_RETIRE_VALUE=
+HANDOFF_WAKE_RETIRE_CORR=
+HANDOFF_WAKE_RETIRE_LOCK=
+HANDOFF_WAKE_RETIRE_STAGE=
+
+handoff_wake_retire_validate() {
+  local marker="$STATE/.backlog-handoff-$ID.wake-pending" value corr rec confirmation
+  HANDOFF_WAKE_RETIRE_MARKER=
+  HANDOFF_WAKE_RETIRE_VALUE=
+  HANDOFF_WAKE_RETIRE_CORR=
+  [ -e "$marker" ] || [ -L "$marker" ] || return 0
+  [ -f "$marker" ] && [ ! -L "$marker" ] || {
+    echo "REFUSED: receiver wake state for secondmate $ID is unsafe" >&2
+    return 1
+  }
+  value=$(cat "$marker" 2>/dev/null || true)
+  case "$value" in
+    pending|confirmed) ;;
+    prepared:*)
+      corr=${value#prepared:}
+      corr=${corr%%:*}
+      printf '%s' "$value" | grep -Eq '^prepared:[a-f0-9]{16}:[a-f0-9]{16}$' || {
+        echo "REFUSED: receiver wake state for secondmate $ID is invalid" >&2
+        return 1
+      }
+      ;;
+    pending:*|confirmed:*)
+      corr=${value#*:}
+      printf '%s' "$corr" | grep -Eq '^[a-f0-9]{16}$' || {
+        echo "REFUSED: receiver wake state for secondmate $ID is invalid" >&2
+        return 1
+      }
+      ;;
+    *)
+      echo "REFUSED: receiver wake state for secondmate $ID is invalid" >&2
+      return 1
+      ;;
+  esac
+  if [ -n "$corr" ]; then
+    rec=$(fm_pending_reply_path "$STATE" "$corr")
+    if [ -e "$rec" ] || [ -L "$rec" ]; then
+      [ -f "$rec" ] && [ ! -L "$rec" ] \
+        && [ "$(fm_pending_reply_get "$rec" task_id)" = "$ID" ] || {
+        echo "REFUSED: receiver wake correlation for secondmate $ID is unsafe or belongs to another task" >&2
+        return 1
+      }
+    fi
+    confirmation=$(fm_pending_reply_delivery_confirmation_path "$STATE" "$corr")
+    if [ -e "$confirmation" ] || [ -L "$confirmation" ]; then
+      [ -f "$confirmation" ] && [ ! -L "$confirmation" ] || {
+        echo "REFUSED: receiver wake delivery state for secondmate $ID is unsafe" >&2
+        return 1
+      }
+    fi
+    HANDOFF_WAKE_RETIRE_CORR=$corr
+  fi
+  HANDOFF_WAKE_RETIRE_MARKER=$marker
+  HANDOFF_WAKE_RETIRE_VALUE=$value
+}
+
+handoff_wake_retire() {
+  local marker=$HANDOFF_WAKE_RETIRE_MARKER corr=$HANDOFF_WAKE_RETIRE_CORR lock rec confirmation rc=0
+  [ -n "$marker" ] || return 0
+  [ -f "$marker" ] && [ ! -L "$marker" ] \
+    && [ "$(cat "$marker" 2>/dev/null || true)" = "$HANDOFF_WAKE_RETIRE_VALUE" ] || return 1
+  if [ -n "$corr" ]; then
+    lock="$STATE/.pending-reply-$corr.lock"
+    fm_lock_acquire_wait "$lock" || return 1
+    rec=$(fm_pending_reply_path "$STATE" "$corr")
+    confirmation=$(fm_pending_reply_delivery_confirmation_path "$STATE" "$corr")
+    if { [ ! -e "$rec" ] && [ ! -L "$rec" ]; } \
+      || { [ -f "$rec" ] && [ ! -L "$rec" ] \
+        && [ "$(fm_pending_reply_get "$rec" task_id)" = "$ID" ]; }; then
+      rm -f -- "$confirmation" "$rec" "$marker" || rc=$?
+    else
+      rc=1
+    fi
+    fm_lock_release "$lock"
+    return "$rc"
+  fi
+  rm -f -- "$marker"
+}
+
+handoff_wake_retire_stage_restore() {
+  local stage=$HANDOFF_WAKE_RETIRE_STAGE marker rec confirmation name destination
+  [ -n "$stage" ] || return 0
+  marker="$STATE/.backlog-handoff-$ID.wake-pending"
+  rec=
+  confirmation=
+  if [ -n "$HANDOFF_WAKE_RETIRE_CORR" ]; then
+    rec=$(fm_pending_reply_path "$STATE" "$HANDOFF_WAKE_RETIRE_CORR")
+    confirmation=$(fm_pending_reply_delivery_confirmation_path "$STATE" "$HANDOFF_WAKE_RETIRE_CORR")
+  fi
+  for name in record confirmation marker; do
+    [ -e "$stage/$name" ] || continue
+    case "$name" in
+      record) destination=$rec ;;
+      confirmation) destination=$confirmation ;;
+      marker) destination=$marker ;;
+    esac
+    [ -n "$destination" ] && [ ! -e "$destination" ] && [ ! -L "$destination" ] \
+      && mv -- "$stage/$name" "$destination" || return 1
+  done
+  rm -f -- "$stage/corr" || return 1
+  rmdir -- "$stage" || return 1
+  if [ -n "$HANDOFF_WAKE_RETIRE_LOCK" ]; then
+    fm_lock_release "$HANDOFF_WAKE_RETIRE_LOCK" || return 1
+    HANDOFF_WAKE_RETIRE_LOCK=
+  fi
+  HANDOFF_WAKE_RETIRE_STAGE=
+}
+
+handoff_wake_retire_stage_commit() {
+  local stage=$HANDOFF_WAKE_RETIRE_STAGE retired
+  [ -n "$stage" ] || return 0
+  retired="$stage.retired.$$"
+  [ ! -e "$retired" ] && [ ! -L "$retired" ] || return 1
+  mv -- "$stage" "$retired" || return 1
+  HANDOFF_WAKE_RETIRE_STAGE=
+  if [ -n "$HANDOFF_WAKE_RETIRE_LOCK" ]; then
+    fm_lock_release "$HANDOFF_WAKE_RETIRE_LOCK" || return 1
+    HANDOFF_WAKE_RETIRE_LOCK=
+  fi
+  rm -rf -- "$retired" || echo "warning: retired receiver wake state remains at $retired" >&2
+}
+
+handoff_wake_retire_stage_recover() {
+  local home=$1 stage="$STATE/.backlog-handoff-$ID.wake-retiring" corr
+  [ -e "$stage" ] || [ -L "$stage" ] || return 0
+  [ -d "$stage" ] && [ ! -L "$stage" ] || {
+    echo "REFUSED: receiver wake retirement state for secondmate $ID is unsafe" >&2
+    return 1
+  }
+  if [ ! -e "$stage/corr" ] && [ ! -L "$stage/corr" ]; then
+    rmdir -- "$stage" 2>/dev/null && return 0
+    echo "REFUSED: receiver wake retirement state for secondmate $ID is incomplete" >&2
+    return 1
+  fi
+  [ -f "$stage/corr" ] && [ ! -L "$stage/corr" ] || {
+    echo "REFUSED: receiver wake retirement state for secondmate $ID is unsafe" >&2
+    return 1
+  }
+  corr=$(cat "$stage/corr" 2>/dev/null || true)
+  [ -z "$corr" ] || printf '%s' "$corr" | grep -Eq '^[a-f0-9]{16}$' || {
+    echo "REFUSED: receiver wake retirement correlation for secondmate $ID is invalid" >&2
+    return 1
+  }
+  local staged
+  for staged in "$stage/marker" "$stage/record" "$stage/confirmation"; do
+    [ ! -e "$staged" ] && [ ! -L "$staged" ] && continue
+    [ -f "$staged" ] && [ ! -L "$staged" ] || {
+      echo "REFUSED: receiver wake retirement state for secondmate $ID is unsafe" >&2
+      return 1
+    }
+  done
+  HANDOFF_WAKE_RETIRE_CORR=$corr
+  HANDOFF_WAKE_RETIRE_STAGE=$stage
+  if [ -n "$corr" ]; then
+    HANDOFF_WAKE_RETIRE_LOCK="$STATE/.pending-reply-$corr.lock"
+    fm_lock_acquire_wait "$HANDOFF_WAKE_RETIRE_LOCK" || return 1
+  fi
+  if [ -e "$home" ] || [ -L "$home" ]; then
+    handoff_wake_retire_stage_restore
+  else
+    handoff_wake_retire_stage_commit
+  fi
+}
+
+handoff_wake_retire_stage() {
+  local stage="$STATE/.backlog-handoff-$ID.wake-retiring" marker=$HANDOFF_WAKE_RETIRE_MARKER
+  local corr=$HANDOFF_WAKE_RETIRE_CORR rec confirmation
+  [ -n "$marker" ] || return 0
+  [ ! -e "$stage" ] && [ ! -L "$stage" ] || return 1
+  (umask 077; mkdir -- "$stage") || return 1
+  HANDOFF_WAKE_RETIRE_STAGE=$stage
+  printf '%s\n' "$corr" > "$stage/corr" || { handoff_wake_retire_stage_restore || true; return 1; }
+  if [ -n "$corr" ]; then
+    HANDOFF_WAKE_RETIRE_LOCK="$STATE/.pending-reply-$corr.lock"
+    fm_lock_acquire_wait "$HANDOFF_WAKE_RETIRE_LOCK" || {
+      HANDOFF_WAKE_RETIRE_LOCK=
+      handoff_wake_retire_stage_restore || true
+      return 1
+    }
+    rec=$(fm_pending_reply_path "$STATE" "$corr")
+    confirmation=$(fm_pending_reply_delivery_confirmation_path "$STATE" "$corr")
+    if [ -e "$rec" ] && ! mv -- "$rec" "$stage/record"; then
+      handoff_wake_retire_stage_restore || true
+      return 1
+    fi
+    if [ -e "$confirmation" ] && ! mv -- "$confirmation" "$stage/confirmation"; then
+      handoff_wake_retire_stage_restore || true
+      return 1
+    fi
+  fi
+  if ! mv -- "$marker" "$stage/marker"; then
+    handoff_wake_retire_stage_restore || true
+    return 1
+  fi
+}
 
 remote_teardown_locks_release() {
   if [ -n "$REMOTE_REPLY_LIFECYCLE_LOCK" ]; then
@@ -342,6 +584,7 @@ remote_secondmate_teardown() {
   [ "$route_host" = "$remote_host" ] && [ "$route_root" = "$remote_root" ] && [ "$route_home" = "$remote_home" ] \
     || { echo "REFUSED: remote secondmate metadata does not match its registry route" >&2; return 1; }
   [ -z "$FORCE" ] || [ "$FORCE" = --force ] || { echo "error: invalid teardown option: $FORCE" >&2; return 2; }
+  handoff_wake_retire_validate || return 1
   remote_recovery_paths_validate initial || return 1
   if [ "$FORCE" != --force ] && [ "$REMOTE_OUTBOX_PRESENT" -eq 1 ]; then
     echo "REFUSED: remote secondmate $ID still has a pending backlog outbox; deliver it or explicitly discard with --force" >&2
@@ -391,6 +634,8 @@ remote_secondmate_teardown() {
   fi
   remote_pending_replies_cleanup \
     || { echo "error: remote pending-reply cleanup failed; preserving the local route for retry" >&2; return 1; }
+  handoff_wake_retire \
+    || { echo "error: remote receiver wake cleanup failed; preserving the local route for retry" >&2; return 1; }
   tmp="$SECONDMATE_REG.tmp.$$"
   grep -vE "^- $ID( |$)" "$SECONDMATE_REG" > "$tmp" || true
   mv -f -- "$tmp" "$SECONDMATE_REG"
@@ -796,43 +1041,312 @@ ensure_commit_object() {
   git -C "$WT" cat-file -e "$commit^{commit}" 2>/dev/null
 }
 
+# --no-prefix only has to be consistent, since every id compared here is
+# computed in the same repository.
 patch_id_for_commit() {
-  local commit=$1
-  git -C "$WT" show --pretty=medium --no-ext-diff "$commit" 2>/dev/null \
-    | git patch-id --stable 2>/dev/null \
-    | awk 'NR == 1 { print $1 }'
+  local commit=$1 tmp patch_output status
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-patch-id.XXXXXX") || return 1
+  if ! git -C "$WT" show --pretty=medium --no-ext-diff --no-prefix "$commit" > "$tmp/patch" 2>/dev/null; then
+    rm -f -- "$tmp/patch"
+    rmdir "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! git patch-id --stable < "$tmp/patch" > "$tmp/ids" 2>/dev/null; then
+    rm -f -- "$tmp/patch" "$tmp/ids"
+    rmdir "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  patch_output=$(awk 'NR == 1 { print $1 }' "$tmp/ids")
+  status=$?
+  rm -f -- "$tmp/patch" "$tmp/ids"
+  rmdir "$tmp" 2>/dev/null || true
+  [ "$status" -eq 0 ] || return 1
+  printf '%s\n' "$patch_output"
 }
 
-unpushed_patches_are_in_pr_head() {
-  local pr_head=$1 current base pr_patch_ids commit patch_id unpushed
-  current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
-  base=$(git -C "$WT" merge-base "$current" "$pr_head" 2>/dev/null) || return 1
-  pr_patch_ids=$(
-    git -C "$WT" log --format=%H "$base..$pr_head" -- 2>/dev/null \
-      | while IFS= read -r commit; do
-          patch_id_for_commit "$commit"
-        done \
-      | sed '/^$/d' \
-      | sort -u
-  ) || return 1
-  [ -n "$pr_patch_ids" ] || return 1
-  unpushed=$(git -C "$WT" log --format=%H HEAD --not --remotes -- 2>/dev/null) || return 1
-  [ -n "$unpushed" ] || return 1
+# Every distinct patch id the commits <git log args...> select carry, as ONE
+# `git log -p | git patch-id` pipeline - the batching `git cherry` itself uses -
+# rather than three processes per commit, so a reference side of any length costs
+# two processes instead of growing with the default branch's history. Commits that
+# emit no diff (empty commits, and merge commits whose conflict resolution
+# `git log -p` does not show) contribute nothing, which is what the reference side
+# wants: they can never prove a subject patch is present.
+patch_ids_for_log() {
+  local tmp status
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-patch-log.XXXXXX") || return 1
+  if ! git -C "$WT" log --format=%H --no-ext-diff --no-prefix -p "$@" > "$tmp/patches" 2>/dev/null; then
+    rm -f -- "$tmp/patches"
+    rmdir "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! git patch-id --stable < "$tmp/patches" > "$tmp/patch-ids" 2>/dev/null; then
+    rm -f -- "$tmp/patches" "$tmp/patch-ids"
+    rmdir "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if ! awk 'NF { print $1 }' "$tmp/patch-ids" > "$tmp/ids"; then
+    rm -f -- "$tmp/patches" "$tmp/patch-ids" "$tmp/ids"
+    rmdir "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  sort -u "$tmp/ids"
+  status=$?
+  rm -f -- "$tmp/patches" "$tmp/patch-ids" "$tmp/ids"
+  rmdir "$tmp" 2>/dev/null || true
+  return "$status"
+}
+
+# The single teardown-and-refuse step every failing arm of
+# changes_are_represented_in_tree takes: remove the scratch index and its
+# directory, then report "not represented". Always returns 1, so each arm is one
+# call plus its own `return 1` and no copy of the cleanup can drift.
+changes_are_represented_in_tree_fail() {
+  local tmp=$1
+  rm -f -- "$tmp/index" "$tmp/index.lock"
+  rmdir "$tmp" 2>/dev/null || true
+  return 1
+}
+
+# The tree-representation proof behind `with-tree-proof`: is the whole
+# <pre>..<post> change still present in <tree>, at the place it landed?
+# A patch id alone cannot answer that, because a patch that landed and was then
+# reverted, partially reverted, relocated, or replaced still has its id on the
+# reference side forever.
+# Each changed path is proven on its own, by reverse-applying that path's patch
+# against a scratch index holding <tree>: reverse-apply succeeds only if <tree>
+# still contains the exact post-image lines the patch added.
+# The proof is deliberately strict in three ways a future simplification must not
+# relax.
+# It is location-preserving: `git apply` reports `Hunk #N succeeded at <line>`
+# whenever it matched at an offset, so any such line means the block was found
+# somewhere other than where it landed and the path is NOT represented (LC_ALL=C
+# pins that message to the text matched here).
+# It is terminator-aware: the per-path patch carries its `\ No newline at end of
+# file` markers and, under --binary --full-index, a literal delta for a binary
+# path, so a difference of only a trailing terminator fails the reverse-apply
+# instead of being normalized away.
+# It only ever allows on positive proof: an unreadable or empty per-path patch,
+# an unreadable scratch index, and every unexpected git failure all report "not
+# represented".
+# The one fallback arm, taken when reverse-apply fails, covers the genuine
+# superset case where <tree> kept the landed file and added unrelated lines on
+# top of it: it requires the path to be newly added by the change (absent in
+# <pre>), present as the same kind of regular blob in <post> and <tree>, textual
+# on both sides, and to have gained lines only - a single deleted line means part
+# of the landed content is gone, so it refuses.
+changes_are_represented_in_tree() {
+  local pre=$1 post=$2 tree=$3 paths path tmp status pre_entry post_entry current_entry
+  local post_meta current_meta post_mode post_type post_oid current_mode current_type current_oid
+  local numstat current_numstat current_additions current_deletions current_path
+  paths=$(git -C "$WT" -c core.quotePath=false diff --name-only --no-renames "$pre" "$post" -- 2>/dev/null) || return 1
+  [ -n "$paths" ] || return 1
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-teardown-current-tree.XXXXXX") || return 1
+  if ! GIT_INDEX_FILE="$tmp/index" git -C "$WT" read-tree "$tree" 2>/dev/null; then
+    changes_are_represented_in_tree_fail "$tmp"
+    return 1
+  fi
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    if ! git -C "$WT" diff --binary --full-index --no-ext-diff --no-prefix --no-renames "$pre" "$post" -- ":(literal)$path" > "$tmp/path.patch" 2>/dev/null; then
+      rm -f -- "$tmp/path.patch"
+      changes_are_represented_in_tree_fail "$tmp"
+      return 1
+    fi
+    if [ ! -s "$tmp/path.patch" ]; then
+      rm -f -- "$tmp/path.patch"
+      changes_are_represented_in_tree_fail "$tmp"
+      return 1
+    fi
+    LC_ALL=C GIT_INDEX_FILE="$tmp/index" git -C "$WT" apply --cached --check --reverse --verbose -p0 \
+      "$tmp/path.patch" > /dev/null 2> "$tmp/apply-output"
+    status=$?
+    rm -f -- "$tmp/path.patch"
+    if [ "$status" -eq 0 ]; then
+      grep -Eq '^Hunk #[0-9]+ succeeded at ' "$tmp/apply-output"
+      status=$?
+      rm -f -- "$tmp/apply-output"
+      if [ "$status" -ne 1 ]; then
+        changes_are_represented_in_tree_fail "$tmp"
+        return 1
+      fi
+      continue
+    fi
+    rm -f -- "$tmp/apply-output"
+    pre_entry=$(git -C "$WT" -c core.quotePath=false ls-tree "$pre" -- ":(literal)$path" 2>/dev/null) || {
+      changes_are_represented_in_tree_fail "$tmp"
+      return 1
+    }
+    [ -z "$pre_entry" ] || {
+      changes_are_represented_in_tree_fail "$tmp"
+      return 1
+    }
+    post_entry=$(git -C "$WT" -c core.quotePath=false ls-tree "$post" -- ":(literal)$path" 2>/dev/null) || {
+      changes_are_represented_in_tree_fail "$tmp"
+      return 1
+    }
+    current_entry=$(git -C "$WT" -c core.quotePath=false ls-tree "$tree" -- ":(literal)$path" 2>/dev/null) || {
+      changes_are_represented_in_tree_fail "$tmp"
+      return 1
+    }
+    [ -n "$post_entry" ] && [ -n "$current_entry" ] || {
+      changes_are_represented_in_tree_fail "$tmp"
+      return 1
+    }
+    post_meta=${post_entry%%$'\t'*}
+    current_meta=${current_entry%%$'\t'*}
+    read -r post_mode post_type post_oid <<EOF
+$post_meta
+EOF
+    read -r current_mode current_type current_oid <<EOF
+$current_meta
+EOF
+    case "$post_mode:$post_type:$current_mode:$current_type" in
+      100644:blob:100644:blob|100755:blob:100755:blob) ;;
+      *)
+        changes_are_represented_in_tree_fail "$tmp"
+        return 1
+        ;;
+    esac
+    [ -n "$post_oid" ] && [ -n "$current_oid" ] || {
+      changes_are_represented_in_tree_fail "$tmp"
+      return 1
+    }
+    numstat=$(git -C "$WT" diff --numstat --no-renames "$pre" "$post" -- ":(literal)$path" 2>/dev/null) || {
+      changes_are_represented_in_tree_fail "$tmp"
+      return 1
+    }
+    current_numstat=$(git -C "$WT" diff --numstat --no-renames "$post" "$tree" -- ":(literal)$path" 2>/dev/null) || {
+      changes_are_represented_in_tree_fail "$tmp"
+      return 1
+    }
+    case "$numstat" in
+      -$'\t'-$'\t'*)
+        changes_are_represented_in_tree_fail "$tmp"
+        return 1
+        ;;
+    esac
+    case "$current_numstat" in
+      -$'\t'-$'\t'*)
+        changes_are_represented_in_tree_fail "$tmp"
+        return 1
+        ;;
+    esac
+    IFS=$'\t' read -r current_additions current_deletions current_path <<EOF
+$current_numstat
+EOF
+    case "$current_path" in
+      '')
+        changes_are_represented_in_tree_fail "$tmp"
+        return 1
+        ;;
+    esac
+    case "$current_additions" in
+      ''|*[!0-9]*)
+        changes_are_represented_in_tree_fail "$tmp"
+        return 1
+        ;;
+    esac
+    case "$current_deletions" in
+      ''|*[!0-9]*)
+        changes_are_represented_in_tree_fail "$tmp"
+        return 1
+        ;;
+    esac
+    if [ "$current_deletions" -ne 0 ]; then
+      changes_are_represented_in_tree_fail "$tmp"
+      return 1
+    fi
+  done <<EOF
+$paths
+EOF
+  rm -f -- "$tmp/index" "$tmp/index.lock"
+  rmdir "$tmp" 2>/dev/null || true
+  return 0
+}
+
+# The one patch-set comparison behind every landed-work patch check, so a future
+# fix to it can never land on only one copy. Takes the reference tree the proof
+# runs against, the reference-side `git log` arguments, the literal separator
+# `::`, then the subject-side ones. Returns 0 when EVERY subject commit's patch
+# appeared on the reference side and every changed path remains represented in
+# that reference tree, 2 when the subject side is empty so there is nothing to
+# prove (the caller decides what that means), and 1 for everything else: an
+# unreadable git log, a subject side that touches no path, a reference side that
+# contributes no patch ids at all, an empty or unreadable subject patch id, any
+# subject commit whose patch is missing, or any subject path whose change is no
+# longer represented in the current reference tree.
+# The reference scan is bounded to the paths the subject commits touch: a commit
+# can only carry a subject commit's patch if it touches exactly those paths, so
+# this can never drop a match, and it keeps unrelated default-branch history out
+# of the comparison. --full-history keeps path limiting from simplifying away a
+# commit that did touch them.
+subject_patches_are_in_reference() {
+  local -a ref_args=() subject_args=() pathspecs=()
+  local reference_tree=$1 past_separator=0 arg ref_ids subject_commits subject_paths commit patch_id path status
+  local subject_tip='' subject_oldest='' subject_base
+  shift
+  git -C "$WT" rev-parse --verify "$reference_tree^{tree}" >/dev/null 2>&1 || return 1
+  for arg in "$@"; do
+    if [ "$past_separator" = 0 ] && [ "$arg" = '::' ]; then
+      past_separator=1
+      continue
+    fi
+    if [ "$past_separator" = 0 ]; then
+      ref_args+=("$arg")
+    else
+      subject_args+=("$arg")
+    fi
+  done
+  [ "${#ref_args[@]}" -gt 0 ] && [ "${#subject_args[@]}" -gt 0 ] || return 1
+  subject_commits=$(git -C "$WT" log --format=%H "${subject_args[@]}" -- 2>/dev/null) || return 1
+  [ -n "$subject_commits" ] || return 2
+  subject_paths=$(git -C "$WT" -c core.quotePath=false log --format= --name-only --no-renames "${subject_args[@]}" -- 2>/dev/null) || return 1
+  [ -n "$subject_paths" ] || return 1
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    pathspecs+=(":(literal)$path")
+  done <<EOF
+$subject_paths
+EOF
+  [ "${#pathspecs[@]}" -gt 0 ] || return 1
+  ref_ids=$(patch_ids_for_log --full-history "${ref_args[@]}" -- "${pathspecs[@]}") || return 1
+  [ -n "$ref_ids" ] || return 1
   while IFS= read -r commit; do
     [ -n "$commit" ] || continue
+    [ -n "$subject_tip" ] || subject_tip=$commit
+    subject_oldest=$commit
     patch_id=$(patch_id_for_commit "$commit") || return 1
     [ -n "$patch_id" ] || return 1
-    printf '%s\n' "$pr_patch_ids" | grep -qxF "$patch_id" || return 1
+    printf '%s\n' "$ref_ids" | grep -qxF "$patch_id" || return 1
   done <<EOF
-$unpushed
+$subject_commits
 EOF
+  [ -n "$subject_tip" ] && [ -n "$subject_oldest" ] || return 1
+  subject_base=$(git -C "$WT" rev-parse --verify "$subject_oldest^" 2>/dev/null) || return 1
+  # A subject range with an empty NET diff (a change and its revert both inside
+  # the range) has no changed path to run the per-path proof over.
+  # It is allowed only here, after the loop above already proved every subject
+  # patch - both inverse patches included - present on the reference side, and
+  # only when the reference tree still matches the subject tip over exactly those
+  # paths, so the sequence is never inferred to have landed from the empty net
+  # diff alone.
+  git -C "$WT" diff --quiet --no-ext-diff --no-renames "$subject_base" "$subject_tip" -- 2>/dev/null
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    if ! git -C "$WT" diff --quiet --no-ext-diff --no-renames "$subject_tip" "$reference_tree" -- \
+      "${pathspecs[@]}" 2>/dev/null; then
+      return 1
+    fi
+    return 0
+  fi
+  [ "$status" -eq 1 ] || return 1
+  changes_are_represented_in_tree "$subject_base" "$subject_tip" "$reference_tree"
 }
 
-# Is the worktree's PR merged for local work contained in that PR? Resolves the
-# PR from the recorded pr= URL first, then from the branch name, and asks GitHub
-# for both the PR state and head. Returns non-zero when the PR is not merged, the
-# current work is not contained in the PR head, no PR is found, or any gh error
-# occurs - the caller then falls back to the content check.
+# Is the worktree's PR merged with its current local work contained in the PR
+# head? Resolves the PR from the recorded pr= URL first, then from the branch
+# name. Returns non-zero when the PR is not merged, its head does not contain the
+# current work, no PR is found, or any gh error occurs.
 pr_is_merged() {
   local branch=$1 target view state head current
   if [ -n "$PR_URL" ]; then
@@ -852,28 +1366,34 @@ pr_is_merged() {
   [ -n "$head" ] || return 1
   ensure_commit_object "$target" "$head" || return 1
   current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
-  git -C "$WT" merge-base --is-ancestor "$current" "$head" 2>/dev/null && return 0
-  unpushed_patches_are_in_pr_head "$head"
+  git -C "$WT" merge-base --is-ancestor "$current" "$head" 2>/dev/null
 }
 
-# Is the branch's content already present in the up-to-date default branch? Fetches
-# first, then 3-way merges the default branch with HEAD: when HEAD introduces nothing
-# the default branch does not already contain (e.g. its change landed via squash) the
-# merged tree equals the default branch's tree. This isolates branch-only changes, so
-# unrelated commits the default branch gained past the merge-base do not count as
-# "added". Returns non-zero when inconclusive (no default ref, or a merge conflict),
-# so the caller refuses rather than guesses.
-content_in_default() {
-  local name ref default_tree merged_tree
+# The up-to-date default-branch ref to test landing against: origin's
+# remote-tracking ref after a fetch when the worktree has an origin, otherwise the
+# local default branch. Returns non-zero when neither exists, so callers stay
+# inconclusive rather than guessing.
+default_landing_ref() {
+  local name
   name=$(default_branch) || return 1
   if git -C "$WT" remote get-url origin >/dev/null 2>&1; then
     git -C "$WT" fetch --quiet origin "+refs/heads/$name:refs/remotes/origin/$name" >/dev/null 2>&1 || return 1
-    ref="refs/remotes/origin/$name"
-  elif git -C "$WT" rev-parse --quiet --verify "refs/heads/$name" >/dev/null 2>&1; then
-    ref="refs/heads/$name"
-  else
-    return 1
+    printf '%s\n' "refs/remotes/origin/$name"
+    return 0
   fi
+  git -C "$WT" rev-parse --quiet --verify "refs/heads/$name" >/dev/null 2>&1 || return 1
+  printf '%s\n' "refs/heads/$name"
+}
+
+# Is the branch's content already present in <ref>? 3-way merges that ref with
+# HEAD: when HEAD introduces nothing the ref does not already contain (e.g. its
+# change landed via squash) the merged tree equals the ref's tree. This isolates
+# branch-only changes, so unrelated commits the ref gained past the merge-base do
+# not count as "added". Returns non-zero when inconclusive (a merge conflict, or a
+# ref with no tree), so the caller refuses rather than guesses.
+content_in_ref() {
+  local ref=$1 default_tree merged_tree
+  [ -n "$ref" ] || return 1
   default_tree=$(git -C "$WT" rev-parse --quiet --verify "$ref^{tree}" 2>/dev/null) || return 1
   [ -n "$default_tree" ] || return 1
   merged_tree=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null) || return 1
@@ -881,15 +1401,42 @@ content_in_default() {
   [ "$merged_tree" = "$default_tree" ]
 }
 
+# Is every commit HEAD holds that <ref> cannot reach already present in <ref> as a
+# PATCH? This is the relationship `git cherry` reports, and it is the only one that
+# can recognize work landed under REWRITTEN commits: a rebase gives every commit a
+# new object id, so reachability alone can never be satisfied afterwards even when
+# the content is fully in. Rebasing is the normal way work lands here, because
+# bin/fm-merge-local.sh is fast-forward-only, so a second chain landing into a moved
+# default branch must rebase first.
+# Deliberately strict, so it can only ever turn a refusal into an allow on proof:
+# EVERY unreachable commit must match, an unreadable or empty patch (an empty
+# commit, or a merge commit, whose conflict resolution `git show` does not emit)
+# never counts as landed, a patch <ref> carries in reverse as well (it landed and
+# was then reverted, so the work is no longer there) does not count either, and a
+# ref that contributes no patches at all is inconclusive. Anything short of a
+# complete match returns non-zero, so genuinely unlanded work still refuses.
+patches_are_in_ref() {
+  local ref=$1 status
+  [ -n "$ref" ] || return 1
+  subject_patches_are_in_reference "$ref" "$ref" --not HEAD :: HEAD --not "$ref"
+  status=$?
+  [ "$status" -eq 0 ] || [ "$status" -eq 2 ]
+}
+
 # Has the worktree's committed work actually LANDED, though its commits are not
-# reachable from any remote-tracking branch? True when a merged PR proves the
-# current local work is contained in the PR head, OR the content is already in the
-# default branch (fallback, which also covers the no-PR and gh-error paths). False
-# only for genuinely unlanded work.
+# reachable from any remote-tracking branch? A merged PR records historical
+# containment, but every allow path requires the current default branch's content
+# or patch-and-tree proof. The default-branch checks also cover the no-PR and
+# gh-error paths. False only for genuinely unlanded work.
+current_default_ref_proves_work() {
+  local ref=$1
+  content_in_ref "$ref" || patches_are_in_ref "$ref"
+}
+
 work_is_landed() {
-  local branch=$1
-  pr_is_merged "$branch" && return 0
-  content_in_default
+  local ref
+  ref=$(default_landing_ref) || return 1
+  current_default_ref_proves_work "$ref"
 }
 
 backlog_refresh_reminder() {
@@ -1135,7 +1682,7 @@ teardown_treehouse_return() {
 }
 
 validate_worktree_teardown_safety() {
-  local dirty_raw dirty unpushed_raw unpushed DEFAULT unmerged_raw unmerged branch
+  local dirty_raw dirty unpushed_raw unpushed DEFAULT unmerged_raw unmerged branch landed_by_patch
   [ -d "$WT" ] || return 0
   [ "$FORCE" != "--force" ] || return 0
   case "$KIND" in
@@ -1173,6 +1720,21 @@ validate_worktree_teardown_safety() {
       return 1
     fi
     unmerged=$(printf '%s\n' "$unmerged_raw" | head -5)
+    # Reachability alone can never recognize a branch whose commits were rewritten
+    # by the rebase that landed them, so consult patch equivalence before refusing.
+    # It clears only commits it can prove are already in $DEFAULT; the uncommitted
+    # check below is untouched, and anything unproven still refuses.
+    landed_by_patch=0
+    if [ -n "$unmerged" ] && patches_are_in_ref "$DEFAULT"; then
+      unmerged=
+      landed_by_patch=1
+    fi
+    if [ "$landed_by_patch" = 1 ] && [ -n "$dirty" ]; then
+      echo "REFUSED: local-only worktree $WT has uncommitted changes; its commits already landed in $DEFAULT." >&2
+      echo "uncommitted changes present" >&2
+      echo "Commit the uncommitted changes (or get the captain's explicit OK to discard, then --force)." >&2
+      return 1
+    fi
     if [ -n "$dirty" ] || [ -n "$unmerged" ]; then
       echo "REFUSED: local-only worktree $WT has work not yet merged into $DEFAULT and not on any remote." >&2
       [ -n "$dirty" ] && echo "uncommitted changes present" >&2
@@ -2267,21 +2829,30 @@ cleanup_firstmate_home_children() {
 }
 
 remove_secondmate_registry_entry() {
-  local id=$1 tmp lock rc=0
+  local id=$1 tmp lock rc=0 acquired=0
   [ -f "$SECONDMATE_REG" ] || return 0
   lock=$(secondmate_registry_lock_path "$STATE")
-  fm_lock_acquire_wait "$lock" || return 1
+  if [ "$LOCAL_REGISTRY_LOCK" != "$lock" ]; then
+    fm_lock_acquire_wait "$lock" || return 1
+    acquired=1
+  fi
   tmp="$SECONDMATE_REG.tmp.$$"
   grep -vE "^- $id( |$)" "$SECONDMATE_REG" > "$tmp" || true
   mv "$tmp" "$SECONDMATE_REG" || rc=$?
-  fm_lock_release "$lock"
+  [ "$acquired" -eq 0 ] || fm_lock_release "$lock"
   return "$rc"
 }
 
 validate_pr_poll_cleanup "$STATE" "$ID" || exit 1
 
 if [ "$KIND" = secondmate ]; then
+  LOCAL_REGISTRY_LOCK=$(secondmate_registry_lock_path "$STATE")
+  fm_lock_acquire_wait "$LOCAL_REGISTRY_LOCK" || exit 1
+  LOCAL_HANDOFF_LOCK="$STATE/.backlog-handoff-$ID.lock"
+  fm_lock_acquire_wait "$LOCAL_HANDOFF_LOCK" || exit 1
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
+  handoff_wake_retire_stage_recover "$HOME_PATH" || exit 1
+  handoff_wake_retire_validate || exit 1
   validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || exit 1
   if [ "$FORCE" = "--force" ]; then
     validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
@@ -2542,7 +3113,18 @@ if [ "$BACKEND" = herdr ]; then
 fi
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
-  remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID" || exit $?
+  handoff_wake_retire_stage \
+    || { echo "error: receiver wake cleanup could not be staged; preserving the secondmate home and route" >&2; exit 1; }
+  if remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID"; then
+    :
+  else
+    rc=$?
+    handoff_wake_retire_stage_restore \
+      || echo "error: receiver wake restoration failed; recovery state remains at $HANDOFF_WAKE_RETIRE_STAGE" >&2
+    exit "$rc"
+  fi
+  handoff_wake_retire_stage_commit \
+    || { echo "error: receiver wake cleanup failed; preserving the secondmate route for retry" >&2; exit 1; }
   remove_secondmate_registry_entry "$ID"
 fi
 remove_grok_turnend_auth "$STATE" "$ID" || exit 1
@@ -2560,6 +3142,10 @@ rm -f "$STATE/$ID.turn-ended" "$STATE/$ID.meta" \
   "$STATE/$ID.muse-session-current" "$STATE/$ID.cursor-session" \
   "$STATE/$ID.control-relaunch" "$STATE/$ID.control-relaunch.meta-prior" \
   "$STATE/$ID.control-relaunch.brief-prior" "$STATE/$ID.control-relaunch.note"
+# The steering inbox (bin/fm-task-inbox-lib.sh) is runtime state for the
+# retired endpoint; teardown only runs after landing is confirmed, so any
+# leftover unhandled steer here is moot rather than unlanded work.
+rm -rf "$STATE/$ID.inbox"
 fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then

@@ -5,9 +5,10 @@
 # treehouse return hard-resets the worktree. "Landed" means reachable from a remote
 # OR - for a normal ship task whose commits are not so reachable - its PR is merged
 # and GitHub reports a PR head that contains the current local work, or its content
-# is already in the up-to-date default branch.
+# is already in the up-to-date default branch, or every commit it holds is already
+# present there as a patch.
 #
-# Covers three fixes:
+# Covers four fixes:
 #   - local-only fork-remote: a fork IS a remote, so fork-pushed upstream-
 #     contribution PRs are teardown-eligible (the pre-fix code false-refused them).
 #   - squash-merge-then-delete-branch: the branch's own commits live nowhere on a
@@ -15,6 +16,12 @@
 #     main. Reachability alone false-refused this common GitHub flow; the check now
 #     recognizes a merged PR head containing the local work (or the content already
 #     in main) as landed.
+#   - rebase-rewrites-commits: a rebase gives every commit a new object id, so a
+#     branch whose content landed under rewritten commits can never satisfy a
+#     reachability test. Because bin/fm-merge-local.sh is fast-forward-only, rebasing
+#     onto a moved default branch is the normal way local-only chains land, which
+#     made this a permanent false refusal. The check now also accepts a branch whose
+#     every commit is present in the default branch as a patch.
 #   - teardown-lock-race: a killed crew process can leave a transient worktree
 #     git index.lock that blocks teardown. The return path retries on the lock
 #     error signature (even if the lock self-clears mid-check), then only removes a
@@ -35,9 +42,30 @@
 #   (l) no-mistakes + stale origin/main but fetched content     -> ALLOW  (fresh fetch)
 #   (m) no-mistakes + local HEAD ancestor of merged PR head     -> ALLOW  (lagging local)
 #   (n) no-mistakes + replayed unpushed patch in merged PR head -> ALLOW  (replayed local)
+#   (n1) no-mistakes + merged PR head evolved past local commit -> ALLOW  (evolved PR head)
 #   (o) fm-pr-check rerun after HEAD moved                      -> no stale pr_head
 #   (p) fm-pr-check when local HEAD lags                        -> record remote PR head
 #   (q) no-mistakes + NO pr= recorded, PR discovered by branch  -> ALLOW  (yolo/no-CI merge)
+#   (q1) local-only + patch landed under a rewritten commit     -> ALLOW  (rebase fix)
+#   (q2) local-only + one commit's patch absent from main       -> REFUSE (safety)
+#   (q2b) local-only + landed patch reverted on main again      -> REFUSE (safety)
+#   (q2c) local-only + combined revert on main                   -> REFUSE (safety)
+#   (q2d) local-only + two landed patches jointly reverted      -> REFUSE (safety)
+#   (q2e) local-only + one file of landed patch reverted         -> REFUSE (safety)
+#   (q2f) local-only + reverted patch re-landed                  -> ALLOW  (current state)
+#   (q2g) local-only + one same-file hunk reverted               -> REFUSE (safety)
+#   (q2h) local-only + one added line reverted                   -> REFUSE (safety)
+#   (q2i) local-only + one added line replaced                   -> REFUSE (safety)
+#   (q2j) local-only + added file fully replaced                 -> REFUSE (safety)
+#   (q2k) local-only + unrelated line appended after landing     -> ALLOW  (superset)
+#   (q2l) local-only + landed trailing newline removed            -> REFUSE (safety)
+#   (q2m) local-only + landed change relocated elsewhere          -> REFUSE (safety)
+#   (q2n) local-only + rewritten inverse sequence is net zero     -> ALLOW  (current state)
+#   (q2o) local-only + net-zero inverse later reverted             -> REFUSE (safety)
+#   (q3) local-only + every patch landed but worktree dirty     -> REFUSE (dirty wins)
+#   (q4) no-mistakes + patch landed, all its content replaced   -> REFUSE (safety)
+#   (q5) local-only + rewritten rename patch landed              -> ALLOW  (rename fix)
+#   (q6) patch-history read fails after emitting output          -> REFUSE (fail-safe)
 #
 # Also covers backlog teardown-lock-race: a git index.lock left in the worktree by a
 # killed crew process (bin/fm-teardown.sh's teardown_treehouse_return).
@@ -253,6 +281,77 @@ land_on_origin_main() {
   git -C "$tmp" -c user.email=t@t -c user.name=t commit -q -m "squash $file"
   git -C "$tmp" push -q origin HEAD:main
   rm -rf "$tmp"
+}
+
+# Move the project's LOCAL default branch on with an unrelated commit, then apply
+# <file>=<content> there as a fresh commit. The resulting commit carries the same
+# patch as the task branch's own commit but a different object id, which is what a
+# rebase-then-fast-forward leaves behind: the branch's commits are unreachable from
+# main while their content is fully landed. Args: case_dir file content
+land_rewritten_patch_on_local_main() {
+  local case_dir=$1 file=$2 content=$3
+  printf '%s\n' "main moved on" > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t \
+    commit -q -m "unrelated main commit"
+  printf '%s\n' "$content" > "$case_dir/project/$file"
+  git -C "$case_dir/project" add -- "$file"
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t \
+    commit -q -m "rebased: add $file"
+}
+
+# Same rewritten-commit landing on the LOCAL default branch, followed by a commit
+# that reverts it again. The patch is in main's history but the work is gone from
+# main's tree, so teardown must not treat the branch as landed.
+# Args: case_dir file content
+land_rewritten_patch_then_revert_on_local_main() {
+  local case_dir=$1 file=$2 content=$3
+  land_rewritten_patch_on_local_main "$case_dir" "$file" "$content"
+  git -C "$case_dir/project" rm -q -- "$file"
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t \
+    commit -q -m "revert: drop $file again"
+}
+
+# Same rewritten-commit landing, but on origin's default branch, followed by a
+# later edit of the same file. The later edit is what makes the whole-tree content
+# check inconclusive, so only patch equivalence can prove the work landed.
+# Args: case_dir file content later_content
+land_rewritten_patch_then_edit_on_origin_main() {
+  local case_dir=$1 file=$2 content=$3 later=$4 tmp
+  tmp="$case_dir/_rebased"
+  git clone -q "$case_dir/origin.git" "$tmp"
+  printf '%s\n' "main moved on" > "$tmp/unrelated.txt"
+  git -C "$tmp" add -- unrelated.txt
+  git -C "$tmp" -c user.email=t@t -c user.name=t commit -q -m "unrelated main commit"
+  printf '%s\n' "$content" > "$tmp/$file"
+  git -C "$tmp" add -- "$file"
+  git -C "$tmp" -c user.email=t@t -c user.name=t commit -q -m "rebased: add $file"
+  printf '%s\n' "$later" > "$tmp/$file"
+  git -C "$tmp" add -- "$file"
+  git -C "$tmp" -c user.email=t@t -c user.name=t commit -q -m "follow-up edit of $file"
+  git -C "$tmp" push -q origin HEAD:main
+  rm -rf "$tmp"
+}
+
+add_git_patch_log_failure() {
+  local case_dir=$1
+  cat > "$case_dir/fakebin/git" <<'SH'
+#!/usr/bin/env bash
+real=${REAL_GIT_FOR_TEST:?}
+args=("$@")
+is_log=0
+is_patch=0
+for arg in "$@"; do
+  [ "$arg" = log ] && is_log=1
+  [ "$arg" = -p ] && is_patch=1
+done
+if [ "$is_log" = 1 ] && [ "$is_patch" = 1 ]; then
+  "$real" "${args[@]}"
+  exit 86
+fi
+exec "$real" "${args[@]}"
+SH
+  chmod +x "$case_dir/fakebin/git"
 }
 
 # Override GitHub lookups to report PR 7 as merged with the supplied head.
@@ -653,6 +752,725 @@ test_local_only_merged_to_local_main_allows() {
   pass "local-only worktree with work merged into local main is torn down (no regression)"
 }
 
+test_local_only_rebased_patch_landed_allows() {
+  local case_dir rc
+  case_dir=$(make_case rebased-landed)
+  write_meta "$case_dir" local-only ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  # main gained an unrelated commit, so landing this branch needed a rebase; the
+  # branch's own commit is now unreachable from main while its patch is fully there.
+  land_rewritten_patch_on_local_main "$case_dir" feature.txt hello
+  git -C "$case_dir/wt" merge-base --is-ancestor HEAD main 2>/dev/null \
+    && fail "rebased-landed: branch commit is still reachable from main; case is vacuous"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "rebased-landed: teardown should succeed when the patch landed under a rewritten commit"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "rebased-landed: teardown printed a REFUSED line"
+  pass "local-only worktree whose patch landed under a rewritten commit is torn down"
+}
+
+test_local_only_rebased_patch_with_absent_commit_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-partial)
+  write_meta "$case_dir" local-only ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  # A second commit whose patch never reaches main: patch equivalence must not
+  # excuse it just because the first commit's patch did land.
+  wt_commit_file "$case_dir" extra.txt "still here" "add extra"
+  land_rewritten_patch_on_local_main "$case_dir" feature.txt hello
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-partial: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-partial: no REFUSED line in stderr"
+  grep -Fq "commits not yet on main" "$case_dir/stderr" \
+    || fail "rebased-partial: refusal did not name the commits still missing from main"
+  pass "local-only worktree with a commit whose patch is absent from main is refused"
+}
+
+test_local_only_rebased_patch_reverted_on_main_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-reverted)
+  write_meta "$case_dir" local-only ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  # The patch landed under a rewritten commit and main then reverted it, so the
+  # work exists nowhere but this worktree; patch equivalence must not clear it.
+  land_rewritten_patch_then_revert_on_local_main "$case_dir" feature.txt hello
+  [ ! -e "$case_dir/project/feature.txt" ] \
+    || fail "rebased-reverted: feature.txt is still in main's tree; case is vacuous"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-reverted: teardown should refuse when the landed patch was reverted"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-reverted: no REFUSED line in stderr"
+  grep -Fq "commits not yet on main" "$case_dir/stderr" \
+    || fail "rebased-reverted: refusal did not name the commits still missing from main"
+  [ -e "$case_dir/wt/feature.txt" ] || fail "rebased-reverted: worktree work was discarded"
+  pass "local-only worktree whose landed patch was reverted on main is refused"
+}
+
+test_local_only_rebased_patch_combined_revert_on_main_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-combined-revert)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' baseline > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "add baseline"
+  git -C "$case_dir/wt" rebase main >/dev/null
+
+  printf '%s\n' feature > "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change shared feature"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' feature > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten feature"
+  printf '%s\n' baseline 'unrelated retained' > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "revert feature with other work"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-combined-revert: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-combined-revert: no REFUSED line in stderr"
+  [ -e "$case_dir/wt/shared.txt" ] || fail "rebased-combined-revert: worktree work was discarded"
+  pass "local-only worktree whose patch was reverted with other work is refused"
+}
+
+test_local_only_rebased_patch_sequence_jointly_reverted_on_main_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-sequence-reverted)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' x > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "add baseline"
+  git -C "$case_dir/wt" rebase main >/dev/null
+
+  printf '%s\n' y > "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change x to y"
+  printf '%s\n' z > "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change y to z"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' y > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten x to y"
+  printf '%s\n' z > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten y to z"
+  printf '%s\n' x > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "jointly revert sequence"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-sequence-reverted: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-sequence-reverted: no REFUSED line in stderr"
+  [ ! -e "$case_dir/treehouse-called" ] || fail "rebased-sequence-reverted: destructive return was invoked"
+  [ -e "$case_dir/wt/shared.txt" ] || fail "rebased-sequence-reverted: worktree work was discarded"
+  pass "local-only worktree whose landed patch sequence was jointly reverted is refused"
+}
+
+test_local_only_rebased_multifile_patch_partially_reverted_on_main_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-partial-revert)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' one > "$case_dir/wt/one.txt"
+  printf '%s\n' two > "$case_dir/wt/two.txt"
+  git -C "$case_dir/wt" add -- one.txt two.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "add both files"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' one > "$case_dir/project/one.txt"
+  printf '%s\n' two > "$case_dir/project/two.txt"
+  git -C "$case_dir/project" add -- one.txt two.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten add both files"
+  git -C "$case_dir/project" rm -q -- two.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "revert one file"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-partial-revert: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-partial-revert: no REFUSED line in stderr"
+  [ ! -e "$case_dir/treehouse-called" ] || fail "rebased-partial-revert: destructive return was invoked"
+  [ -e "$case_dir/wt/two.txt" ] || fail "rebased-partial-revert: worktree work was discarded"
+  pass "local-only worktree whose multi-file patch was partially reverted is refused"
+}
+
+test_local_only_rebased_patch_reverted_then_relanded_allows() {
+  local case_dir rc
+  case_dir=$(make_case rebased-relanded)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' x > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "add baseline"
+  git -C "$case_dir/wt" rebase main >/dev/null
+  printf '%s\n' y > "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change x to y"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' y > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten landing"
+  printf '%s\n' x > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "revert landing"
+  printf '%s\n' y > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "re-land change"
+  git -C "$case_dir/wt" merge-base --is-ancestor HEAD main 2>/dev/null \
+    && fail "rebased-relanded: branch commit is still reachable from main"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "rebased-relanded: teardown should accept the final landed state"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "rebased-relanded: teardown printed a REFUSED line"
+  pass "local-only worktree whose reverted patch was re-landed is torn down"
+}
+
+test_local_only_rebased_patch_relocated_to_identical_block_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-relocated-identical-block)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' \
+    p1 p2 p3 p4 p5 \
+    context-one context-two context-three target context-four context-five context-six \
+    s1 s2 s3 s4 s5 s6 s7 s8 \
+    context-one context-two context-three target context-four context-five context-six \
+    z1 z2 z3 z4 z5 > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "add repeated baseline"
+  git -C "$case_dir/wt" rebase main >/dev/null
+
+  awk '$0 == "target" && !changed { print "landed"; changed = 1; next } { print }' \
+    "$case_dir/wt/shared.txt" > "$case_dir/wt/shared.next"
+  mv "$case_dir/wt/shared.next" "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change first repeated block"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  awk '$0 == "target" && !changed { print "landed"; changed = 1; next } { print }' \
+    "$case_dir/project/shared.txt" > "$case_dir/project/shared.next"
+  mv "$case_dir/project/shared.next" "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten first-block landing"
+  awk '
+    $0 == "landed" && !reverted { print "target"; reverted = 1; next }
+    $0 == "target" { print "landed"; next }
+    { print }
+  ' "$case_dir/project/shared.txt" > "$case_dir/project/shared.next"
+  mv "$case_dir/project/shared.next" "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "relocate landing to second block"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-relocated-identical-block: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-relocated-identical-block: no REFUSED line in stderr"
+  [ ! -e "$case_dir/treehouse-called" ] || fail "rebased-relocated-identical-block: destructive return was invoked"
+  [ "$(sed -n '9p' "$case_dir/wt/shared.txt")" = landed ] \
+    || fail "rebased-relocated-identical-block: worktree change was discarded"
+  pass "local-only worktree whose landed change moved to an identical block is refused"
+}
+
+test_local_only_rebased_inverse_sequence_with_net_zero_change_allows() {
+  local case_dir rc
+  case_dir=$(make_case rebased-net-zero-sequence)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' x > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "add baseline"
+  git -C "$case_dir/wt" rebase main >/dev/null
+  printf '%s\n' y > "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change x to y"
+  printf '%s\n' x > "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change y back to x"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' y > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten x to y"
+  printf '%s\n' x > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten y back to x"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "rebased-net-zero-sequence: teardown should allow"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "rebased-net-zero-sequence: teardown printed a REFUSED line"
+  [ -e "$case_dir/treehouse-called" ] || fail "rebased-net-zero-sequence: teardown did not invoke worktree return"
+  pass "local-only worktree whose rewritten inverse patches net to zero is torn down"
+}
+
+test_local_only_rebased_net_zero_inverse_later_reverted_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-net-zero-inverse-reverted)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' x > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "add baseline"
+  git -C "$case_dir/wt" rebase main >/dev/null
+  printf '%s\n' y > "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change x to y"
+  printf '%s\n' x > "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change y back to x"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' y > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten x to y"
+  printf '%s\n' x > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten y back to x"
+  printf '%s\n' y > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "revert rewritten inverse"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-net-zero-inverse-reverted: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-net-zero-inverse-reverted: no REFUSED line in stderr"
+  [ ! -e "$case_dir/treehouse-called" ] || fail "rebased-net-zero-inverse-reverted: destructive return was invoked"
+  grep -Fxq x "$case_dir/wt/shared.txt" || fail "rebased-net-zero-inverse-reverted: worktree content was discarded"
+  pass "local-only net-zero worktree whose inverse was later reverted is refused"
+}
+
+test_local_only_rebased_same_file_hunk_partially_reverted_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-hunk-revert)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 > "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "add baseline"
+  git -C "$case_dir/wt" rebase main >/dev/null
+
+  sed -e 's/^a2$/landed-two/' -e 's/^a11$/landed-eleven/' "$case_dir/wt/shared.txt" > "$case_dir/wt/shared.next"
+  mv "$case_dir/wt/shared.next" "$case_dir/wt/shared.txt"
+  git -C "$case_dir/wt" add -- shared.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "change two separated hunks"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  sed -e 's/^a2$/landed-two/' -e 's/^a11$/landed-eleven/' "$case_dir/project/shared.txt" > "$case_dir/project/shared.next"
+  mv "$case_dir/project/shared.next" "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten separated hunks"
+  sed 's/^landed-eleven$/a11/' "$case_dir/project/shared.txt" > "$case_dir/project/shared.next"
+  mv "$case_dir/project/shared.next" "$case_dir/project/shared.txt"
+  git -C "$case_dir/project" add -- shared.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "revert second hunk"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-hunk-revert: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-hunk-revert: no REFUSED line in stderr"
+  [ ! -e "$case_dir/treehouse-called" ] || fail "rebased-hunk-revert: destructive return was invoked"
+  grep -Fxq landed-eleven "$case_dir/wt/shared.txt" || fail "rebased-hunk-revert: worktree hunk was discarded"
+  pass "local-only worktree whose same-file patch was partially reverted is refused"
+}
+
+test_local_only_rebased_added_line_partially_reverted_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-added-line-revert)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' A B > "$case_dir/wt/feature.txt"
+  git -C "$case_dir/wt" add -- feature.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "add two-line feature"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' A B > "$case_dir/project/feature.txt"
+  git -C "$case_dir/project" add -- feature.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten two-line feature"
+  printf '%s\n' A > "$case_dir/project/feature.txt"
+  git -C "$case_dir/project" add -- feature.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "revert added line"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-added-line-revert: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-added-line-revert: no REFUSED line in stderr"
+  [ ! -e "$case_dir/treehouse-called" ] || fail "rebased-added-line-revert: destructive return was invoked"
+  grep -Fxq B "$case_dir/wt/feature.txt" || fail "rebased-added-line-revert: worktree line was discarded"
+  pass "local-only worktree whose added line was reverted is refused"
+}
+
+test_local_only_rebased_added_line_replaced_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-added-line-replaced)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' A B > "$case_dir/wt/feature.txt"
+  git -C "$case_dir/wt" add -- feature.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "add two-line feature"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' A B > "$case_dir/project/feature.txt"
+  git -C "$case_dir/project" add -- feature.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten two-line feature"
+  printf '%s\n' A C > "$case_dir/project/feature.txt"
+  git -C "$case_dir/project" add -- feature.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "replace added line"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-added-line-replaced: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-added-line-replaced: no REFUSED line in stderr"
+  [ ! -e "$case_dir/treehouse-called" ] || fail "rebased-added-line-replaced: destructive return was invoked"
+  grep -Fxq B "$case_dir/wt/feature.txt" || fail "rebased-added-line-replaced: worktree line was discarded"
+  pass "local-only worktree whose added line was replaced is refused"
+}
+
+test_local_only_rebased_added_file_fully_replaced_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-added-file-replaced)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' A B > "$case_dir/wt/feature.txt"
+  git -C "$case_dir/wt" add -- feature.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "add two-line feature"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' A B > "$case_dir/project/feature.txt"
+  git -C "$case_dir/project" add -- feature.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten two-line feature"
+  printf '%s\n' C D > "$case_dir/project/feature.txt"
+  git -C "$case_dir/project" add -- feature.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "replace entire feature"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-added-file-replaced: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-added-file-replaced: no REFUSED line in stderr"
+  [ ! -e "$case_dir/treehouse-called" ] || fail "rebased-added-file-replaced: destructive return was invoked"
+  grep -Fxq A "$case_dir/wt/feature.txt" || fail "rebased-added-file-replaced: worktree content was discarded"
+  grep -Fxq B "$case_dir/wt/feature.txt" || fail "rebased-added-file-replaced: worktree content was discarded"
+  pass "local-only worktree whose added file was fully replaced is refused"
+}
+
+test_local_only_rebased_added_file_superset_allows() {
+  local case_dir rc
+  case_dir=$(make_case rebased-added-file-superset)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' A > "$case_dir/wt/feature.txt"
+  git -C "$case_dir/wt" add -- feature.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "add feature"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf '%s\n' A > "$case_dir/project/feature.txt"
+  git -C "$case_dir/project" add -- feature.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten feature"
+  printf '%s\n' A B > "$case_dir/project/feature.txt"
+  git -C "$case_dir/project" add -- feature.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "append unrelated content"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "rebased-added-file-superset: teardown should allow"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "rebased-added-file-superset: teardown printed a REFUSED line"
+  [ -e "$case_dir/treehouse-called" ] || fail "rebased-added-file-superset: teardown did not invoke worktree return"
+  pass "local-only worktree whose landed file gained unrelated content is torn down"
+}
+
+test_local_only_rebased_added_file_loses_trailing_newline_refuses() {
+  local case_dir rc expected_hash actual_hash
+  case_dir=$(make_case rebased-added-file-no-newline)
+  write_meta "$case_dir" local-only ship
+
+  printf 'A\n' > "$case_dir/wt/feature.txt"
+  git -C "$case_dir/wt" add -- feature.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "add feature"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  printf 'A\n' > "$case_dir/project/feature.txt"
+  git -C "$case_dir/project" add -- feature.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten feature"
+  printf A > "$case_dir/project/feature.txt"
+  git -C "$case_dir/project" add -- feature.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "remove trailing newline"
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-added-file-no-newline: teardown should refuse"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-added-file-no-newline: no REFUSED line in stderr"
+  [ ! -e "$case_dir/treehouse-called" ] || fail "rebased-added-file-no-newline: destructive return was invoked"
+  expected_hash=$(printf 'A\n' | git hash-object --stdin)
+  actual_hash=$(git hash-object "$case_dir/wt/feature.txt")
+  [ "$actual_hash" = "$expected_hash" ] || fail "rebased-added-file-no-newline: worktree content was discarded"
+  pass "local-only worktree whose landed trailing newline was removed is refused"
+}
+
+test_local_only_rewritten_rename_patch_landed_allows() {
+  local case_dir rc
+  case_dir=$(make_case rewritten-rename)
+  write_meta "$case_dir" local-only ship
+
+  printf '%s\n' payload > "$case_dir/project/old-name.txt"
+  git -C "$case_dir/project" add -- old-name.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "add rename source"
+  git -C "$case_dir/wt" rebase main >/dev/null
+  git -C "$case_dir/wt" mv old-name.txt new-name.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "rename source"
+
+  printf '%s\n' moved > "$case_dir/project/unrelated.txt"
+  git -C "$case_dir/project" add -- unrelated.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "main moved"
+  git -C "$case_dir/project" mv old-name.txt new-name.txt
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t commit -q -m "rewritten rename"
+  git -C "$case_dir/wt" merge-base --is-ancestor HEAD main 2>/dev/null \
+    && fail "rewritten-rename: branch commit is still reachable from main"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "rewritten-rename: teardown should accept the landed rename patch"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "rewritten-rename: teardown printed a REFUSED line"
+  pass "local-only worktree whose rename landed under a rewritten commit is torn down"
+}
+
+test_patch_log_failure_after_output_refuses() {
+  local case_dir rc
+  case_dir=$(make_case patch-log-failure)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  land_rewritten_patch_then_edit_on_origin_main "$case_dir" feature.txt hello revised
+  add_git_patch_log_failure "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "patch-log-failure: teardown should fail closed"
+  grep -q REFUSED "$case_dir/stderr" || fail "patch-log-failure: no REFUSED line in stderr"
+  [ -e "$case_dir/wt/feature.txt" ] || fail "patch-log-failure: worktree work was discarded"
+  pass "partial patch-history output cannot authorize teardown"
+}
+
+test_local_only_rebased_patch_landed_but_dirty_refuses() {
+  local case_dir rc
+  case_dir=$(make_case rebased-dirty)
+  write_meta "$case_dir" local-only ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  land_rewritten_patch_on_local_main "$case_dir" feature.txt hello
+  # Every commit's patch landed, but the worktree still holds uncommitted work.
+  printf '%s\n' "not committed anywhere" > "$case_dir/wt/scratch.txt"
+  git -C "$case_dir/wt" add -- scratch.txt
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "rebased-dirty: teardown should refuse on uncommitted changes"
+  grep -q REFUSED "$case_dir/stderr" || fail "rebased-dirty: no REFUSED line in stderr"
+  grep -Fq "uncommitted changes present" "$case_dir/stderr" \
+    || fail "rebased-dirty: refusal did not name the uncommitted changes"
+  grep -Fq "its commits already landed in" "$case_dir/stderr" \
+    || fail "rebased-dirty: refusal did not credit the commits as already landed"
+  grep -Fq "Commit the uncommitted changes" "$case_dir/stderr" \
+    || fail "rebased-dirty: refusal did not point at the uncommitted change"
+  ! grep -Eq "not yet merged into|Merge the branch into local" "$case_dir/stderr" \
+    || fail "rebased-dirty: refusal still claims the branch has unmerged work"
+  pass "worktree with uncommitted changes is refused even when every commit's patch landed"
+}
+
+test_no_mistakes_rebased_patch_landed_after_full_replacement_refuses() {
+  local case_dir rc
+  case_dir=$(make_case nm-rebased-landed)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "add feature"
+  land_rewritten_patch_then_edit_on_origin_main "$case_dir" feature.txt hello revised
+
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+touch "$case_dir/treehouse-called"
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "nm-rebased-landed: teardown should refuse when all subject content was replaced"
+  grep -q REFUSED "$case_dir/stderr" || fail "nm-rebased-landed: no REFUSED line in stderr"
+  [ ! -e "$case_dir/treehouse-called" ] || fail "nm-rebased-landed: destructive return was invoked"
+  grep -Fxq hello "$case_dir/wt/feature.txt" || fail "nm-rebased-landed: worktree content was discarded"
+  pass "no-mistakes worktree whose landed content was fully replaced is refused"
+}
+
 test_no_mistakes_origin_remote_allows() {
   local case_dir rc
   case_dir=$(make_case nm-origin)
@@ -696,11 +1514,11 @@ test_squash_merged_branch_deleted_allows() {
   local case_dir rc pr_head
   case_dir=$(make_case squash-merged)
   write_meta "$case_dir" no-mistakes ship
-  # Real branch content that is NOT pushed and NOT on origin/main: a squash merge
-  # rewrote it into a different commit on main and auto-deleted the head branch, so
-  # HEAD is unreachable from every remote-tracking branch. The matching merged PR is
-  # the only signal that the work landed.
+  # A squash merge rewrote the commit on main and deleted the head branch, so HEAD
+  # is unreachable from every remote-tracking branch while its content remains in
+  # the current default branch.
   wt_commit_file "$case_dir" feature.txt hello "add feature"
+  land_on_origin_main "$case_dir" feature.txt hello
   append_pr_meta_for_current_head "$case_dir"
   pr_head=$(git -C "$case_dir/wt" rev-parse HEAD)
   add_gh_pr_merged_for_head "$case_dir" "$pr_head"
@@ -723,6 +1541,7 @@ test_squash_merged_pr_allows_when_head_ancestor_of_pr_head() {
   append_pr_meta_url "$case_dir"
   local_head=$(git -C "$case_dir/wt" rev-parse HEAD)
   pr_head=$(commit_tree_from_wt_head "$case_dir" "$local_head" "no-mistakes follow-up")
+  land_on_origin_main "$case_dir" feature.txt hello
   add_gh_pr_merged_for_head "$case_dir" "$pr_head"
 
   set +e
@@ -778,6 +1597,11 @@ test_squash_merged_pr_allows_replayed_unpushed_patch() {
   wt_commit_file "$case_dir" feature.txt hello "add feature"
   append_pr_meta_url "$case_dir"
   pr_head=$(land_equivalent_patch_on_origin_branch "$case_dir" pr-head feature.txt hello "add feature")
+  # The merged PR's parent commit is part of the current local tree too, so the
+  # default branch must carry it before the current-tree proof may authorize
+  # teardown.
+  land_on_origin_main "$case_dir" local-parent.txt parent
+  land_on_origin_main "$case_dir" feature.txt hello
   add_gh_pr_merged_for_head "$case_dir" "$pr_head"
 
   set +e
@@ -788,6 +1612,44 @@ test_squash_merged_pr_allows_replayed_unpushed_patch() {
   expect_code 0 "$rc" "squash-replayed-patch: teardown should succeed when unpushed local patch is in the merged PR head"
   ! grep -q REFUSED "$case_dir/stderr" || fail "squash-replayed-patch: teardown printed a REFUSED line"
   pass "squash-merged PR accepts replayed unpushed local patches contained in the PR head"
+}
+
+test_merged_pr_head_evolved_after_local_commit_refuses() {
+  local case_dir rc parent_head pr_head tmp
+  case_dir=$(make_case pr-head-evolved)
+  write_meta "$case_dir" no-mistakes ship
+  # The PR first takes the local change, then replaces it, while origin/main never
+  # gains the original change.
+  wt_commit_file "$case_dir" local-parent.txt parent "local parent"
+  parent_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  git -C "$case_dir/wt" push -q origin "$parent_head:refs/heads/fm/task-x1"
+  git -C "$case_dir/project" fetch -q origin fm/task-x1
+  printf 'A\nB\n' > "$case_dir/wt/feature.txt"
+  git -C "$case_dir/wt" add -- feature.txt
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m "add feature"
+  append_pr_meta_url "$case_dir"
+  tmp="$case_dir/_evolved"
+  git clone -q "$case_dir/origin.git" "$tmp"
+  printf 'A\nB\n' > "$tmp/feature.txt"
+  git -C "$tmp" add -- feature.txt
+  git -C "$tmp" -c user.email=t@t -c user.name=t commit -q -m "add feature"
+  printf 'A\nC\n' > "$tmp/feature.txt"
+  git -C "$tmp" add -- feature.txt
+  git -C "$tmp" -c user.email=t@t -c user.name=t commit -q -m "review fix on the PR branch"
+  git -C "$tmp" push -q origin HEAD:refs/heads/pr-head
+  git -C "$case_dir/project" fetch -q origin pr-head
+  rm -rf "$tmp"
+  pr_head=$(git -C "$case_dir/project" rev-parse refs/remotes/origin/pr-head)
+  add_gh_pr_merged_for_head "$case_dir" "$pr_head"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "pr-head-evolved: teardown should refuse when the merged PR later replaces the local change"
+  grep -q REFUSED "$case_dir/stderr" || fail "pr-head-evolved: no REFUSED line in stderr"
+  pass "merged-PR containment refuses when the current default branch lacks the local change"
 }
 
 test_merged_pr_with_later_local_commit_refuses() {
@@ -2596,6 +3458,26 @@ test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
 test_local_only_truly_unpushed_refuses
 test_local_only_merged_to_local_main_allows
+test_local_only_rebased_patch_landed_allows
+test_local_only_rebased_patch_with_absent_commit_refuses
+test_local_only_rebased_patch_reverted_on_main_refuses
+test_local_only_rebased_patch_combined_revert_on_main_refuses
+test_local_only_rebased_patch_sequence_jointly_reverted_on_main_refuses
+test_local_only_rebased_multifile_patch_partially_reverted_on_main_refuses
+test_local_only_rebased_patch_reverted_then_relanded_allows
+test_local_only_rebased_patch_relocated_to_identical_block_refuses
+test_local_only_rebased_inverse_sequence_with_net_zero_change_allows
+test_local_only_rebased_net_zero_inverse_later_reverted_refuses
+test_local_only_rebased_same_file_hunk_partially_reverted_refuses
+test_local_only_rebased_added_line_partially_reverted_refuses
+test_local_only_rebased_added_line_replaced_refuses
+test_local_only_rebased_added_file_fully_replaced_refuses
+test_local_only_rebased_added_file_superset_allows
+test_local_only_rebased_added_file_loses_trailing_newline_refuses
+test_local_only_rebased_patch_landed_but_dirty_refuses
+test_no_mistakes_rebased_patch_landed_after_full_replacement_refuses
+test_local_only_rewritten_rename_patch_landed_allows
+test_patch_log_failure_after_output_refuses
 test_no_mistakes_origin_remote_allows
 test_no_mistakes_truly_unpushed_refuses
 test_local_only_force_overrides_unpushed
@@ -2615,6 +3497,7 @@ test_squash_merged_branch_deleted_allows
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows
 test_squash_merged_pr_allows_replayed_unpushed_patch
+test_merged_pr_head_evolved_after_local_commit_refuses
 test_merged_pr_with_later_local_commit_refuses
 test_pr_check_does_not_refresh_stale_pr_head
 test_pr_check_records_remote_head_when_local_lags
