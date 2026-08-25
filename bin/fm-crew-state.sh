@@ -34,7 +34,11 @@
 #      A run matches when its head equals the worktree HEAD, or the worktree HEAD
 #      is an ancestor of the run head (pipeline fix commits advanced the run on
 #      the same line of history). Local work that advanced past the run head, or
-#      diverged from it, invalidates attribution.
+#      diverged from it, invalidates attribution. A terminal (failed/cancelled/
+#      completed) `axi status` answer is cross-checked against the newest-first
+#      `no-mistakes runs` listing before being trusted: it can be a SUPERSEDED
+#      predecessor run while a newer run on the same branch is actively
+#      validating, and that newer run always wins.
 #      The run-step is AUTHORITATIVE: running/fixing -> working, ci -> working,
 #      awaiting_approval/fix_review -> parked (with gate findings), terminal
 #      passed/checks-passed -> done, failed/cancelled -> failed. EXCEPT: while
@@ -430,6 +434,24 @@ nm_coarse_head_matches_worktree() {  # <short-sha>
   fm_nm_head_matches_worktree "$WT" "$1"
 }
 
+# 0 if the full `axi status` TOON in $RUN_OUT reports a TERMINAL run: the same
+# outcome/status words the run-step block below maps to done/failed. Used only
+# to decide whether a terminal full-status answer needs cross-checking against
+# the newest-run listing (a bare `axi status` answer can be a SUPERSEDED
+# predecessor run - see the HAVE_RUN block below).
+nm_full_result_is_terminal() {
+  local outcome status
+  outcome=$(strip_quotes "$(nm_field outcome)")
+  case "$outcome" in
+    passed|checks-passed|failed|cancelled) return 0 ;;
+  esac
+  status=$(strip_quotes "$(nm_field status)")
+  case "$status" in
+    completed|failed|cancelled) return 0 ;;
+  esac
+  return 1
+}
+
 HAVE_RUN=0
 # RUN_SOURCE distinguishes the two ways HAVE_RUN=1 can happen: "full" means
 # $RUN_OUT is real `axi status` TOON with step/gate detail; "coarse" means only
@@ -445,6 +467,22 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
     run_branch=$(strip_quotes "$(nm_field branch)")
     if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ] && nm_run_head_matches_worktree; then
       HAVE_RUN=1
+      # `axi status` (bare) has no notion of "newest run for this branch" - it
+      # can still answer with a SUPERSEDED terminal predecessor run (e.g.
+      # cancelled during a rebase custody-recovery) even while a newer run on
+      # the same branch is actively validating. Cross-check the authoritative
+      # newest-first `no-mistakes runs` listing before trusting a terminal
+      # full-status answer, so a superseded failed/cancelled predecessor never
+      # shadows a healthy successor. A genuinely terminal branch with nothing
+      # newer leaves NEWER_STATUS empty (or itself terminal) and the full
+      # answer stands unchanged.
+      if nm_full_result_is_terminal; then
+        NEWER_STATUS=$(nm_runs_status_for_branch "$CREW_BRANCH")
+        if [ "$NEWER_STATUS" = running ]; then
+          RUN_SOURCE=coarse
+          COARSE_STATUS=$NEWER_STATUS
+        fi
+      fi
     else
       # The active-or-most-recent run is for another branch, or same branch with
       # a rewritten/diverged head (the CLI is alive and answered; only the
