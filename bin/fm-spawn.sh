@@ -2731,10 +2731,6 @@ if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
   SPAWN_TASK_SET_LOCK_HELD=0
   fm_lock_release "$SPAWN_TASK_SET_LOCK"
 fi
-if [ "$HARNESS_ADMISSION_LOCK_HELD" = 1 ]; then
-  HARNESS_ADMISSION_LOCK_HELD=0
-  fm_lock_release "$HARNESS_ADMISSION_LOCK"
-fi
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 
 sq_brief=$(shell_quote "$BRIEF")
@@ -2845,6 +2841,10 @@ if [ "${HERDR_PROJECTED:-0}" -eq 1 ]; then
   spawn_herdr_presentation_order_lock_release
 fi
 spawn_send_key "$T" Enter
+if [ "$HARNESS_ADMISSION_LOCK_HELD" = 1 ]; then
+  HARNESS_ADMISSION_LOCK_HELD=0
+  fm_lock_release "$HARNESS_ADMISSION_LOCK"
+fi
 if [ "$HARNESS" = kimi ]; then
   if ! kimi_wait_for_ready; then
     kimi_spawn_fail "kimi did not show a verified ready signal before brief delivery"

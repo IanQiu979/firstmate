@@ -133,6 +133,9 @@ test_limit_defaults_and_validates() {
   printf 'nope\n' > "$home/config/harness-concurrency-limit"
   [ "$(fm_harness_concurrency_limit "$home/config" 2>/dev/null)" = 3 ] \
     || fail "a malformed config value should fall back to the default"
+  printf '000\n' > "$home/config/harness-concurrency-limit"
+  [ "$(fm_harness_concurrency_limit "$home/config" 2>/dev/null)" = 3 ] \
+    || fail "an all-zero config value like '000' should fall back to the default, not silently zero the cap"
   pass "fm_harness_concurrency_limit: absent -> 3, valid value honored, malformed falls back"
 }
 
@@ -301,6 +304,68 @@ test_concurrent_admission_publishes_only_one_final_slot() {
   pass "concurrent admission: two contenders at 2/3 publish exactly one final slot"
 }
 
+# --- admission lock must span the create-pane-then-launch-later gap ---------
+#
+# bin/fm-spawn.sh creates the new endpoint's pane, publishes its meta, and only
+# THEN sends the actual launch command into it - so right after meta
+# publication the freshly created pane is still a bare shell (reads "dead"
+# until the launch command actually starts the agent process). A worker that
+# releases its admission lock at publish time (instead of after the launch
+# command is sent) lets a second admission scan run during that gap, see the
+# first worker's new pane as dead, and wrongly admit past the cap. This
+# reproduces that exact shape with a real tmux window and a real delayed
+# transition from dead to alive, using the SAME lock/check/publish/release
+# primitives fm-spawn.sh uses, held across the gap the way the fix requires.
+test_admission_lock_spans_dead_window_before_launch() {
+  local home id1 id2 result_a result_b success_count
+  home=$(new_home lock-spans-gap)
+  id1=hc-gap-a-q1
+  id2=hc-gap-b-q2
+  new_alive_window "hc-gap-1" claude-link
+  new_alive_window "hc-gap-2" claude-link
+  wait_for_alive "$SESSION:hc-gap-1" || fail "fixture window hc-gap-1 never went alive"
+  wait_for_alive "$SESSION:hc-gap-2" || fail "fixture window hc-gap-2 never went alive"
+  fm_write_meta "$home/state/hc-gap-existing-a-q1.meta" "window=$SESSION:hc-gap-1" "harness=claude" "kind=ship"
+  fm_write_meta "$home/state/hc-gap-existing-b-q2.meta" "window=$SESSION:hc-gap-2" "harness=claude" "kind=ship"
+
+  # Simulates fm-spawn.sh's real sequence: admit -> create a bare-shell pane ->
+  # publish meta pointing at it (still dead) -> only later actually launch the
+  # agent into it (now alive) -> release the admission lock.
+  spawn_like_worker() {
+    local id=$1 window=$2 lock
+    lock=$(fm_harness_concurrency_admission_lock_path "$home/state" claude) || return 1
+    fm_lock_acquire_wait "$lock" || return 1
+    if ! fm_harness_concurrency_check "$home/state" "$home/config" claude; then
+      fm_lock_release "$lock"
+      return 1
+    fi
+    new_dead_window "$window"
+    fm_write_meta "$home/state/$id.meta" "window=$SESSION:$window" "harness=claude" "kind=ship"
+    wait_for_dead "$SESSION:$window" || true
+    sleep 0.3
+    "$REAL_TMUX" -L "$SOCKET" send-keys -t "$SESSION:$window" \
+      "exec $LAB/bin/claude-link 900" Enter
+    wait_for_alive "$SESSION:$window" || true
+    fm_lock_release "$lock"
+    return 0
+  }
+
+  spawn_like_worker "$id1" hc-gap-new-1 >"$home/a.out" 2>&1 &
+  local pid_a=$!
+  spawn_like_worker "$id2" hc-gap-new-2 >"$home/b.out" 2>&1 &
+  local pid_b=$!
+  wait "$pid_a" && result_a=success || result_a=refused
+  wait "$pid_b" && result_b=success || result_b=refused
+  success_count=0
+  [ "$result_a" = success ] && success_count=$((success_count + 1))
+  [ "$result_b" = success ] && success_count=$((success_count + 1))
+  [ "$success_count" -eq 1 ] \
+    || fail "a racing admission during the dead-pane-before-launch gap must not both be admitted at a cap of 3 with 2 existing holders plus 1 remaining slot"
+  [ "$(fm_harness_live_holders "$home/state" claude | wc -l | tr -d ' ')" -eq 3 ] \
+    || fail "the admission lock spanning the dead-window gap must leave exactly three live claude slots (2 pre-existing + 1 admitted)"
+  pass "admission lock spans the dead-pane-before-launch gap: a racing admission during it is refused"
+}
+
 test_missing_zellij_endpoint_does_not_hold_slot() {
   local home fake_zellij old_path holders
   home=$(new_home zellij-missing)
@@ -363,6 +428,7 @@ test_over_cap_reports_correctly
 test_mixed_harnesses_are_independent
 test_dead_and_missing_endpoints_do_not_hold_slots
 test_concurrent_admission_publishes_only_one_final_slot
+test_admission_lock_spans_dead_window_before_launch
 test_missing_zellij_endpoint_does_not_hold_slot
 test_secondmates_are_excluded
 

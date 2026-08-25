@@ -39,12 +39,17 @@ fm_harness_concurrency_limit() {  # <config-dir>
   [ -f "$file" ] || { printf '%s' "$FM_HARNESS_CONCURRENCY_LIMIT_DEFAULT"; return 0; }
   value=$(tr -d '[:space:]' < "$file" 2>/dev/null || true)
   case "$value" in
-    ''|0|*[!0-9]*)
+    ''|*[!0-9]*)
       echo "warning: config/$FM_HARNESS_CONCURRENCY_LIMIT_FILE ('$value') is not a positive integer; using default $FM_HARNESS_CONCURRENCY_LIMIT_DEFAULT" >&2
       printf '%s' "$FM_HARNESS_CONCURRENCY_LIMIT_DEFAULT"
       ;;
     *)
-      printf '%s' "$value"
+      if [ -z "${value//0/}" ]; then
+        echo "warning: config/$FM_HARNESS_CONCURRENCY_LIMIT_FILE ('$value') is not a positive integer; using default $FM_HARNESS_CONCURRENCY_LIMIT_DEFAULT" >&2
+        printf '%s' "$FM_HARNESS_CONCURRENCY_LIMIT_DEFAULT"
+      else
+        printf '%s' "$value"
+      fi
       ;;
   esac
 }
