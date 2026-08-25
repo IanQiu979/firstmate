@@ -289,6 +289,7 @@ fm_backend_zellij_pane_exists() {  # <session> <pane_id>
 fm_backend_zellij_agent_state() {  # <target>
   local panes count
   fm_backend_zellij_parse_target "$1" || { printf 'unreadable'; return 0; }
+  command -v zellij >/dev/null 2>&1 || { printf 'unverified'; return 0; }
   if ! zellij list-sessions --short --no-formatting >/dev/null 2>&1; then
     printf 'unreadable'
     return 0
