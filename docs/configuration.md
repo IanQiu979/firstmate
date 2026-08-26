@@ -272,6 +272,16 @@ The Kimi installer requires an existing regular non-symlink `~/.kimi-code/config
 Its `remove` action excises only the marker-delimited Firstmate region and removes Firstmate's hook files.
 For Pi and pi-signed secondmate launches, `fm-spawn.sh` starts the selected executable with `-e` pointed at the secondmate home's own tracked `.pi/extensions/fm-primary-pi-watch.ts` and `.pi/extensions/fm-primary-turnend-guard.ts`, both already present from the secondmate home's git worktree.
 
+## Per-harness concurrency cap (config/harness-concurrency-limit)
+
+`bin/fm-spawn.sh` refuses a fresh ship/scout spawn or a relaunch when its harness already has the configured number of live agents, counted across every project and task in this home - not per project, and not per graph.
+`config/harness-concurrency-limit` is a local, gitignored file holding one positive base-10 integer; when it is absent, or present but not a positive integer, the effective cap is `3`.
+The count is a live read on every spawn, never a separate tally file: `bin/fm-harness-concurrency-lib.sh` scans `state/*.meta` for tasks whose recorded `harness=` matches, then probes each one's actual backend endpoint with `fm_backend_agent_alive` (`bin/fm-backend.sh`), the same recovery-grade liveness primitive the fleet digest and recovery paths already trust.
+A confirmed-dead or missing endpoint never holds a slot, so a crashed or torn-down task cannot wedge the cap; an ambiguous, unreadable, or unverified read counts as held, the fail-closed direction.
+Persistent secondmates are exempt - they are not the "concurrent agents" the cap bounds - and a relaunch is checked exactly like a fresh spawn since it starts a new live process.
+A refusal names the harness, the live count against the cap, and the exact task ids holding a slot, and happens before any backend session, worktree, or metadata is allocated, so nothing is left to clean up.
+`bin/fm-harness-concurrency-lib.sh` is the single owner of the counting and cap-check contract; its function-level comments own every inclusion/exclusion decision in full.
+
 ## Crew dispatch profiles (config/crew-dispatch.json)
 
 `config/crew-dispatch.json` is an optional local, gitignored file containing natural-language rules that firstmate reads before dispatching a crewmate or scout.

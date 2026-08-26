@@ -176,6 +176,10 @@
 # resolver because `cursor` is not the CLI name. A cursor SECONDMATE instead runs
 # the tracked project-scope .cursor/hooks.json in its own home, whose stop-hook
 # park owns that home's supervision (docs/supervision-protocols/cursor.md).
+# A fresh ship/scout spawn or relaunch refuses when its harness is already at
+# its configured concurrency cap (config/harness-concurrency-limit, default 3;
+# docs/configuration.md "Per-harness concurrency cap" owns the contract).
+# Secondmates are exempt. bin/fm-harness-concurrency-lib.sh owns the check.
 # On success prints: spawned <id> harness=<name> kind=<ship|scout|secondmate> [mode=<mode> yolo=<on|off>] window=<backend-target> worktree=<path>
 # A ship task records the explicit mode/yolo it was passed; a secondmate spawn records
 # mode=secondmate, yolo=off, home=, and projects=; a scout records neither, and both the
@@ -246,6 +250,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-harness-concurrency-lib.sh
+. "$SCRIPT_DIR/fm-harness-concurrency-lib.sh"
 # shellcheck source=bin/fm-control-lib.sh
 . "$SCRIPT_DIR/fm-control-lib.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
@@ -665,6 +671,8 @@ SPAWN_META_LOCK_HELD=0
 SPAWN_META_PUBLISH_STARTED=0
 SPAWN_TASK_SET_LOCK=
 SPAWN_TASK_SET_LOCK_HELD=0
+HARNESS_ADMISSION_LOCK=
+HARNESS_ADMISSION_LOCK_HELD=0
 RELAUNCH_REPLACEMENT_PENDING=0
 RELAUNCH_REPLACEMENT_BUSY_GEN=
 RELAUNCH_REPLACEMENT_HARNESS=
@@ -773,6 +781,10 @@ spawn_abort_cleanup() {
   if [ "$SPAWN_TASK_SET_LOCK_HELD" = 1 ]; then
     SPAWN_TASK_SET_LOCK_HELD=0
     fm_lock_release "$SPAWN_TASK_SET_LOCK" || true
+  fi
+  if [ "$HARNESS_ADMISSION_LOCK_HELD" = 1 ]; then
+    HARNESS_ADMISSION_LOCK_HELD=0
+    fm_lock_release "$HARNESS_ADMISSION_LOCK" || true
   fi
   if [ "$SPAWN_CONTROL_LOCK_HELD" = 1 ]; then
     SPAWN_CONTROL_LOCK_HELD=0
@@ -1272,6 +1284,22 @@ case "$HARNESS" in
     fi
     ;;
 esac
+
+# Per-harness concurrency cap (AGENTS.md; the captain's own feature request):
+# no more than a configured number of LIVE agents on this harness at a time,
+# counted across every project and task in this home. Secondmates are exempt;
+# fm_harness_live_holders' header owns that and every other counting decision.
+# Checked here - HARNESS is final and nothing has been allocated yet - so a
+# refusal leaves no worktree, metadata, or backend session behind.
+if [ "$KIND" != secondmate ]; then
+  HARNESS_ADMISSION_LOCK=$(fm_harness_concurrency_admission_lock_path "$STATE" "$HARNESS") || {
+    echo "error: could not resolve the harness admission lock for '$HARNESS'" >&2
+    exit 1
+  }
+  fm_lock_acquire_wait "$HARNESS_ADMISSION_LOCK"
+  HARNESS_ADMISSION_LOCK_HELD=1
+  fm_harness_concurrency_check "$STATE" "$CONFIG" "$HARNESS" "$ID" || exit 1
+fi
 
 # config/secondmate-harness may carry optional model/effort tokens alongside the
 # harness ("<harness> [<model>] [<effort>]"). They apply only when this is a
@@ -2828,6 +2856,10 @@ if [ "${HERDR_PROJECTED:-0}" -eq 1 ]; then
   spawn_herdr_presentation_order_lock_release
 fi
 spawn_send_key "$T" Enter
+if [ "$HARNESS_ADMISSION_LOCK_HELD" = 1 ]; then
+  HARNESS_ADMISSION_LOCK_HELD=0
+  fm_lock_release "$HARNESS_ADMISSION_LOCK"
+fi
 if [ "$HARNESS" = kimi ]; then
   if ! kimi_wait_for_ready; then
     kimi_spawn_fail "kimi did not show a verified ready signal before brief delivery"
