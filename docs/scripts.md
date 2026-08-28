@@ -133,4 +133,4 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-voice-client.py`     | The laptop end of the spoken interface: capture, playback, and turn timing over SSH; audio devices unverified |
 | `fm_voice_frame.py`      | The wire format both machines share, copied to the laptop beside the client          |
 | `fm_voice_records.py`    | What a spoken answer may read, and the handover that queues real work                |
-| `fm-briefing-lint.sh`    | Validate one daily briefing Markdown file against its file contract; standalone, not wired into any hook or workflow |
+| `fm-briefing-lint.sh`    | Validate one daily briefing Markdown file against its file contract; also invoked by `fm-session-start.sh`'s optional briefing-lint stage |
