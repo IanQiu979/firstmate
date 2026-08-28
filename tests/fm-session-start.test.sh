@@ -11,6 +11,9 @@
 #   - output section ordering: the safety preamble leads unchanged, live fleet
 #     state precedes the curated memory a truncated tail may take, and the
 #     read-once contract precedes both
+#   - optional daily-briefing lint: absent media and clean files stay silent,
+#     while violations in today's and yesterday's files are labeled without
+#     gating session start
 #   - context-aware next-step guidance for read-only, AFK, X mode, and normal
 #     watcher ownership
 #   - status-tail bounding, default and FM_SESSION_START_STATUS_TAIL override
@@ -993,6 +996,94 @@ EOF
   pass "digest sections are ordered safety-preamble first, live fleet state before curated memory"
 }
 
+# write_session_briefing <mount> <date> <weekday>: a complete briefing fixture
+# whose filename and mtime match its content date. Supplying a deliberately
+# wrong weekday creates one lint finding without weakening the integration test
+# by replacing the real linter.
+write_session_briefing() {
+  local mount=$1 briefing_date=$2 weekday=$3 file stamp
+  mkdir -p "$mount/Daily Briefings"
+  file="$mount/Daily Briefings/$briefing_date.md"
+  cat > "$file" <<EOF
+# Daily Briefing — $weekday $briefing_date
+**Status: live**
+**Last updated: 10:00 +07** — rewritten on every append.
+
+## Open for the captain
+Nothing pending.
+
+## Shipped today
+Nothing shipped.
+
+## Broke / went wrong
+Nothing broke.
+
+## Still open
+Nothing open.
+
+## Log
+## 08:00 +07 — Started
+Work began.
+## 08:30 +07 — Continued
+Work continued.
+## 09:00 +07 — Finished
+Work finished.
+
+## Reference
+No references.
+EOF
+  stamp=${briefing_date//-/}
+  touch -t "${stamp}1200" "$file"
+}
+
+test_daily_briefing_lint_is_optional_quiet_and_informational() {
+  local rec root home fakebin mount out today yesterday today_weekday yesterday_weekday status=0
+  rec=$(new_world briefing-lint)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+
+  out=$(FM_SESSION_START_BRIEFING_MOUNT="$TMP_ROOT/absent-briefing-volume" \
+    run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_not_contains "$out" "BRIEFING_LINT:" \
+    "an absent briefing volume produced lint output"
+
+  mount="$TMP_ROOT/briefing-volume"
+  today=$(date '+%Y-%m-%d')
+  if yesterday=$(date -v-1d '+%Y-%m-%d' 2>/dev/null); then
+    :
+  else
+    yesterday=$(date -d yesterday '+%Y-%m-%d')
+  fi
+  today_weekday=$(date -j -f '%Y-%m-%d' "$today" '+%A' 2>/dev/null \
+    || date -d "$today" '+%A')
+  yesterday_weekday=$(date -j -f '%Y-%m-%d' "$yesterday" '+%A' 2>/dev/null \
+    || date -d "$yesterday" '+%A')
+  write_session_briefing "$mount" "$today" "$today_weekday"
+  write_session_briefing "$mount" "$yesterday" "$yesterday_weekday"
+
+  out=$(FM_SESSION_START_BRIEFING_MOUNT="$mount" \
+    run_session_start "$home" "$root" "$fakebin:$BASE_PATH") || status=$?
+  expect_code 0 "$status" "clean daily-briefing lint session start"
+  assert_not_contains "$out" "BRIEFING_LINT:" \
+    "clean daily briefings added noise to the digest"
+
+  write_session_briefing "$mount" "$today" Wrongday
+  write_session_briefing "$mount" "$yesterday" Wrongday
+  status=0
+  out=$(FM_SESSION_START_BRIEFING_MOUNT="$mount" \
+    run_session_start "$home" "$root" "$fakebin:$BASE_PATH") || status=$?
+  expect_code 0 "$status" "daily-briefing findings must not gate session start"
+  assert_contains "$out" "BRIEFING_LINT: $today: weekday:" \
+    "today's daily-briefing violation was not labeled in the digest"
+  assert_contains "$out" "BRIEFING_LINT: $yesterday: weekday:" \
+    "yesterday's daily-briefing violation was not labeled in the digest"
+
+  pass "session start silently skips absent or clean briefings and labels informational findings for today and yesterday"
+}
+
 # The contract has to survive tail truncation and stay honest once it precedes
 # the sections it governs, so it carries the truncated-stage escape itself.
 test_read_once_contract_is_stated_once_before_its_subject() {
@@ -1828,7 +1919,7 @@ EOF
   assert_contains "$out" "RUNTIME BOUND" "the truncation banner did not name the bound it hit"
   assert_contains "$out" 'stopped during the "bootstrap" stage' "the truncation banner did not name the incomplete stage"
   assert_contains "$out" "RECONCILE these stages" "the truncation banner did not tell the agent what to reconcile"
-  assert_contains "$out" "wake-queue supervision-instructions read-once fleet-state network-checks context next-step" \
+  assert_contains "$out" "wake-queue supervision-instructions read-once fleet-state network-checks context briefing-lint next-step" \
     "the truncation banner did not list every stage that never ran"
   assert_not_contains "$out" "NEXT STEP" "a truncated digest claimed to have reached its closing reminder"
   assert_absent "$home/state/.session-start-complete" \
@@ -2462,6 +2553,7 @@ test_lock_write_failure_read_only_path
 test_trace_context_effective_state_is_frozen_after_lock
 test_session_lock_concurrent_single_winner
 test_output_ordering_diagnostics_lead
+test_daily_briefing_lint_is_optional_quiet_and_informational
 test_read_once_contract_is_stated_once_before_its_subject
 test_herdr_backend_diagnostics_follow_real_session_start
 test_session_start_relaunches_missing_pi_secondmate

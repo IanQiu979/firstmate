@@ -52,11 +52,14 @@
 #   8. context digest - data/projects.md, data/secondmates.md, data/captain.md,
 #                       data/captain-shared.md, data/learnings.md: read-only,
 #                       always safe, always runs.
-#   9. closing reminder - prints the context-specific watcher next step; this
+#   9. briefing lint  - when /Volumes/IanUSB is mounted, checks today's and
+#                       yesterday's daily briefings and reports violations only.
+#                       This read-only informational step never gates startup.
+#  10. closing reminder - prints the context-specific watcher next step; this
 #                       script points back to the emitted harness supervision
 #                       block and deliberately never arms the watcher itself.
 #
-# Those nine names are also the runtime-bound stage list below, so a truncated
+# Those ten names are also the runtime-bound stage list below, so a truncated
 # startup can name exactly which of them never ran.
 #
 # NO NETWORK ON THE BLOCKING PATH. This digest runs on a session-open hook that
@@ -253,7 +256,7 @@ done
 # The ordered stage list is the contract behind the truncation banner: the child
 # names the stage it is entering, and the parent reports every stage at or after
 # that one as never emitted. Keep it in the exact order the digest prints.
-SESSION_START_STAGES='lock bootstrap wake-queue supervision-instructions read-once fleet-state network-checks context next-step'
+SESSION_START_STAGES='lock bootstrap wake-queue supervision-instructions read-once fleet-state network-checks context briefing-lint next-step'
 
 stage() {  # <stage-name>: breadcrumb for the parent's truncation banner
   [ -n "${FM_SESSION_START_STAGE_FILE:-}" ] || return 0
@@ -375,6 +378,51 @@ print_file_or_absent() {
   else
     printf 'ABSENT\n'
   fi
+}
+
+# daily_briefing_yesterday: portable yesterday date for the optional USB
+# briefing check. The mounted volume and files remain the authority for whether
+# there is anything to lint, so failure to derive the date stays silent.
+daily_briefing_yesterday() {
+  local result
+  result=$(date -v-1d '+%Y-%m-%d' 2>/dev/null) && {
+    printf '%s\n' "$result"
+    return 0
+  }
+  result=$(date -d yesterday '+%Y-%m-%d' 2>/dev/null) && {
+    printf '%s\n' "$result"
+    return 0
+  }
+  return 1
+}
+
+# print_daily_briefing_lint: lint today's and yesterday's briefing when the
+# optional USB volume is mounted. Clean and absent files print nothing. Any
+# finding or linter execution error is informational and cannot gate startup.
+print_daily_briefing_lint() {
+  local mount briefing_dir today yesterday briefing_date briefing output rc line
+  mount=${FM_SESSION_START_BRIEFING_MOUNT:-/Volumes/IanUSB}
+  [ -d "$mount" ] || return 0
+
+  briefing_dir="$mount/Daily Briefings"
+  today=$(date '+%Y-%m-%d' 2>/dev/null) || return 0
+  yesterday=$(daily_briefing_yesterday 2>/dev/null) || yesterday=
+
+  for briefing_date in "$today" "$yesterday"; do
+    [ -n "$briefing_date" ] || continue
+    briefing="$briefing_dir/$briefing_date.md"
+    [ -f "$briefing" ] || continue
+
+    output=$("$SCRIPT_DIR/fm-briefing-lint.sh" "$briefing" 2>&1)
+    rc=$?
+    [ "$rc" -ne 0 ] || continue
+    [ -n "$output" ] || output="linter exited $rc without output"
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ -n "$line" ] || continue
+      printf 'BRIEFING_LINT: %s: %s\n' "$briefing_date" "$line"
+    done <<< "$output"
+  done
+  return 0
 }
 
 print_backlog_pointer() {
@@ -900,7 +948,14 @@ print_file_or_absent "$DATA/captain.md" "data/captain.md"
 print_file_or_absent "$DATA/captain-shared.md" "data/captain-shared.md (shared, main-authoritative, read-only in secondmate homes)"
 print_file_or_absent "$DATA/learnings.md" "data/learnings.md"
 
-# --- 9. closing reminder -----------------------------------------------
+# --- 9. daily briefing lint --------------------------------------------
+# Optional and informational: a missing USB volume or briefing file is silent,
+# clean files add no digest noise, and findings never change session-start's
+# success path.
+stage briefing-lint
+print_daily_briefing_lint
+
+# --- 10. closing reminder ----------------------------------------------
 stage next-step
 section "NEXT STEP"
 if [ "$READ_ONLY" -eq 1 ]; then
