@@ -151,16 +151,33 @@ seed_commitment() {
     || fail "could not register the public commitment"
 }
 
+# Portable epoch-seconds -> ISO8601 UTC, matching this file's existing
+# BSD-then-GNU `date` fallback convention (see test_expiry_escalation_uses_now_override).
+iso_from_epoch() {
+  local epoch=$1
+  date -u -r "$epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+    || date -u -d "@$epoch" '+%Y-%m-%dT%H:%M:%SZ'
+}
+
 # The pi-rearm shape: a report-ready promised-final bound to a secondmate.
+# The follow-up window is anchored to the real clock (not a fixed calendar
+# date) so this fixture never ages into a spurious "expired" failure; the
+# exact expiry epoch it picked is left in LAST_REPRO_EXPIRES_EPOCH for tests
+# that need to reason about the boundary.
 seed_repro_commitment() {   # <home> <obligation> <request> <work-home> <work-id>
   local home=$1 obligation=$2 request=$3 work_home=$4 work_id=$5
-  jq -n --arg r "$request" \
+  local now_epoch received_at followup_expires_at
+  now_epoch=$(date -u +%s)
+  LAST_REPRO_EXPIRES_EPOCH=$((now_epoch + 7 * 86400))
+  received_at=$(iso_from_epoch $((now_epoch - 7 * 86400)))
+  followup_expires_at=$(iso_from_epoch "$LAST_REPRO_EXPIRES_EPOCH")
+  jq -n --arg r "$request" --arg received "$received_at" --arg expires "$followup_expires_at" \
     '{request_id:$r, platform:"discord",
       context_binding:{version:"ctx1", value:("ctx1_" + $r)},
       public_safe_summary:"reproduce a Pi recovery notification loop",
-      received_at:"2026-08-21T01:12:00Z",
-      followup_expires_at:"2026-08-28T01:12:00Z",
-      reservation_expires_at:"2026-08-28T01:12:00Z"}' > "$home/request.json"
+      received_at:$received,
+      followup_expires_at:$expires,
+      reservation_expires_at:$expires}' > "$home/request.json"
   jq -n '{type:"report-ready", project:"firstmate",
           required_deliverables:["report_path"], completion_policy:"all-required"}' \
     > "$home/expected.json"
@@ -2010,8 +2027,7 @@ test_expiry_escalation_uses_now_override() {
   local home out exp now_closing now_expired registry tmp
   home=$(make_home expiry-window)
   seed_repro_commitment "$home" pf-exp req-exp main work-exp
-  exp=$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' '2026-08-28T01:12:00Z' +%s 2>/dev/null) \
-    || exp=$(date -u -d '2026-08-28T01:12:00Z' +%s)
+  exp=$LAST_REPRO_EXPIRES_EPOCH
   now_closing=$((exp - 3600))
   now_expired=$((exp + 60))
   out=$(FMX_NOW_OVERRIDE="$now_expired" run_pf "$home" pending)
