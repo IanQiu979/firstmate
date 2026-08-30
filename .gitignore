@@ -11,3 +11,10 @@ __pycache__/
 *.pyc
 .env
 config/
+
+# session-handoff note, local only
+.codex/HANDOFF.md
+
+# stray tool caches, never meant to live in this repo
+.wrangler/
+supabase/
