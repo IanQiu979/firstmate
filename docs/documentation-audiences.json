@@ -177,6 +177,14 @@
       "audience": "agent-runtime"
     },
     {
+      "path": ".agents/skills/ship-maintain-checkback/SKILL.md",
+      "audience": "agent-runtime"
+    },
+    {
+      "path": ".agents/skills/ship-planning-gate/SKILL.md",
+      "audience": "agent-runtime"
+    },
+    {
       "path": ".agents/skills/stow/SKILL.md",
       "audience": "agent-runtime"
     },

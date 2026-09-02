@@ -284,6 +284,8 @@ Classify the deliverable:
 - **Ship** is the default and produces a project change through the selected delivery mode; once implementation is authorized, dispatch a ship and keep any remaining bounded research inside it unless unresolved uncertainty could materially change whether or what to build.
 - **Scout** produces knowledge in `data/<id>/report.md`, never a PR, and is appropriate for investigation, diagnosis, planning, reproduction, or audit work when the captain explicitly requests a separate knowledge or design deliverable or unresolved uncertainty could materially change whether or what to build.
 
+Before writing a Ship brief for a new feature or a bug fix in a registered project whose approach is not already fully specified by the request itself, load `ship-planning-gate` and reach an explicit captain-approved plan before dispatch, restating the plan and waiting for a go every time even when the request already reads like one; a trivial, fully-specified one-off (a version bump, a rename, a copy fix) skips straight to dispatch as today, and this gate does not apply to firstmate's own tracked-material maintenance (section 1's shared tracked list).
+
 If established evidence already answers an informational question, relay it without a design-only scout; when implementation intent is unclear, answer and ask one concise implementation question when useful rather than dispatching speculative design work.
 Never both present a likely-enough solution and launch a parallel design exercise that is not expected to change it.
 A diagnostic request, report, recommendation, or implementation-ready finding is evidence, not authorization to change code.
@@ -368,6 +370,10 @@ Run `bin/fm-pr-check.sh <id> <PR url>` - it records `pr=` and the forge's `pr_he
 Tell the captain the PR's full URL, always the complete `https://...` link rather than a bare `#number`, a concise outcome summary, and the no-mistakes risk level when applicable.
 A captain instruction to merge is explicit authority; `yolo` is the only standing routine merge authority.
 For any custom `state/<id>.check.sh` you write yourself, keep it an ordinary single-link mode-`0700` file, print one line only when firstmate should wake, print nothing otherwise, finish before `FM_CHECK_TIMEOUT`, then bind its current bytes with `bin/fm-check-register.sh <id>` before the watcher may execute it.
+
+When a project's registry entry carries a `[deploy: manual]` tag (`data/projects.md`; `project-management` owns the tag syntax), treat the named post-merge step as part of delivery: confirm it happened - or hand it to the captain when it is his own action - before reporting the task done.
+No tag or `[deploy: auto]` means merge is deploy, as today.
+Also at landing, unless the project's registry entry carries `[maintain: off]`, load `ship-maintain-checkback` and register a decoupled post-deploy check-back before moving on; this does not delay teardown, which still proceeds immediately once landing is confirmed.
 
 Tear down a ship task only after landing is confirmed.
 A teardown refusal for uncommitted or unlanded work is a stop-and-investigate result, never an obstacle to bypass.
@@ -535,6 +541,8 @@ These skills are not captain-invocable; load them only at their precise triggers
 
 - `bootstrap-diagnostics` - load whenever the session-start digest's bootstrap or network-checks section prints an actionable diagnostic line (`MISSING:`, `MISSING_MANUAL:`, `BACKEND_INVALID:`, `NEEDS_GH_AUTH`, `TANGLE:`, `STARTUP_MEMORY_BUDGET:`, `CREW_DISPATCH: invalid`, `FLEET_SYNC:`, `NETWORK_CHECKS:`, `PR_CHECK_MIGRATION:`, `SECONDMATE_SYNC:`, `SECONDMATE_LIVENESS:`, `SECONDMATE_HANDOFF:`, `NUDGE_SECONDMATES:`, or `FMX:`); silence and `BOOTSTRAP_INFO:` need no load.
 - `diagnostic-reasoning` - load before scoping a reported bug and before acting on a diagnostic report.
+- `ship-planning-gate` - load before writing a Ship brief for a new feature or non-trivial bug fix in a registered project, to reach and record an explicit captain-approved plan before dispatch; does not apply to firstmate's own tracked-material maintenance.
+- `ship-maintain-checkback` - load immediately after landing is confirmed for a registered project, to register a decoupled, single-fire post-deploy check-back; owns the default interval, the `[maintain: ...]` tag, what the check verifies, and how a finding is handled at wake time.
 - `ask-user-authority` - load before deciding any ask-user finding.
 - `quota-array-dispatch` - load before choosing among a matched crew-dispatch profile array from current quota-axi default TOON.
 - `harness-adapters` - load before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter.

@@ -52,6 +52,18 @@ The optional `+yolo` posture changes merge authority only and does not change th
 Default it off for every project and every posture, and enable it only on the captain's explicit instruction.
 `AGENTS.md` section 7 owns the merge-authority contract.
 
+## Deploy and maintain tags
+
+A registry entry may carry two further bracket tags, each independent of the mode/yolo bracket above and read directly by firstmate at the lifecycle steps that consume them rather than by `bin/fm-project-mode.sh`'s mechanical parser.
+Keep each as its own separate bracket group so the existing mode/yolo bracket's grammar is untouched.
+
+- `[deploy: manual]` names a post-merge step distinct from the merge itself - a manual redeploy command, a release cut, a publish step.
+  No tag or `[deploy: auto]` means merge is deploy, which is every already-registered project's unchanged default.
+- `[maintain: <duration>]` sets this project's post-deploy check-back interval; `[maintain: off]` disables it for this project.
+  No tag defaults to the check-back mechanism's own default interval.
+
+`AGENTS.md` section 7 owns when each tag is consumed: the Deploy step for `[deploy: ...]`, and the `ship-maintain-checkback` skill for `[maintain: ...]`.
+
 ## Add or clone an existing project
 
 Confirm the source URL, local project name, delivery posture, and autonomy posture, stating the resolved default for each rather than asking the captain to invent one.
