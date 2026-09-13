@@ -1,0 +1,24 @@
+$ git show --stat --oneline c17d0d7 | head
+c17d0d7 chore(skills): remove decision-hold-lifecycle deprecation stub
+ .agents/skills/decision-hold-lifecycle/SKILL.md | 15 ---------------
+ docs/documentation-audiences.json               |  4 ----
+ 2 files changed, 19 deletions(-)
+
+$ git grep -n decision-hold-lifecycle -- . ; echo exit=$?
+exit=1  (1 = no tracked file references the deleted skill)
+
+$ ls .agents/skills | grep hold
+captain-hold-lifecycle
+
+$ bash bin/fm-doc-audience-check.sh --root .
+fm-doc-audience-check: ok surfaces=75 local_links=276
+exit=0
+
+# Negative control: same checker with the deleted entry re-added to a temp copy of the inventory (proves it validates paths)
+$ bash bin/fm-doc-audience-check.sh --root . --inventory $TMP/inv.json
+fm-doc-audience-check: not tracked/in scope: .agents/skills/decision-hold-lifecycle/SKILL.md
+exit=1
+
+$ bin/fm-decision-hold.sh id demo k1   (compat shim still works without the skill dir)
+demo-decision-k1
+exit=0
