@@ -35,13 +35,6 @@ report() {
   VIOLATIONS=$((VIOLATIONS + 1))
 }
 
-clock_minutes() {
-  local stamp=$1 hour minute
-  hour=${stamp%:*}
-  minute=${stamp#*:}
-  printf '%s\n' "$((10#$hour * 60 + 10#$minute))"
-}
-
 weekday_for_date() {
   local value=$1 result
   result=$(date -j -f '%Y-%m-%d' "$value" '+%A' 2>/dev/null) && {
@@ -92,43 +85,58 @@ else
   fi
 fi
 
-# Read stamped sections once for ordering, liveness, and header freshness.
-section_re='^## (([01][0-9]|2[0-3]):[0-5][0-9])[[:space:]]+\+07[[:space:]]+—[[:space:]]+.+$'
-distinct_sections=0
-seen_sections='|'
-previous_stamp=
-previous_minutes=
-last_section_stamp=
-last_section_minutes=
-line_number=0
+# The template fixes exactly one h2 list, in exactly this order, so every day
+# is scannable the same way. A section with nothing to report keeps its
+# heading (with a "- none" line under it) rather than being dropped, and h3
+# subsections under those h2 headings are free-form.
+required_headings=(
+  'Fleet state'
+  'Open'
+  'Shipped'
+  'Broke'
+  'Reference'
+)
+expected_order=$(printf '%s, ' "${required_headings[@]}")
+expected_order=${expected_order%, }
+
+# Collect the h2 headings as one newline-joined list rather than an array:
+# stock macOS bash 3.2 aborts under `set -u` when expanding an empty array.
+h2_re='^##[[:space:]]+(.+)$'
+found_list=
 while IFS= read -r line || [ -n "$line" ]; do
-  line_number=$((line_number + 1))
-  if [[ $line =~ $section_re ]]; then
-    stamp=${BASH_REMATCH[1]}
-    minutes=$(clock_minutes "$stamp")
-    case "$seen_sections" in
-      *"|$stamp|"*) ;;
-      *)
-        distinct_sections=$((distinct_sections + 1))
-        seen_sections="${seen_sections}${stamp}|"
-        ;;
-    esac
-    if [ -n "$previous_minutes" ] && [ "$minutes" -le "$previous_minutes" ]; then
-      report section-order "line $line_number stamp $stamp is not later than $previous_stamp"
-    fi
-    previous_stamp=$stamp
-    previous_minutes=$minutes
-    last_section_stamp=$stamp
-    last_section_minutes=$minutes
+  if [[ $line =~ $h2_re ]]; then
+    found_list="${found_list}${BASH_REMATCH[1]}"$'\n'
   fi
 done < "$BRIEFING"
 
-if grep -Eq '^\*\*Status:[[:space:]]*live\*\*[[:space:]]*$' "$BRIEFING"; then
-  if [ "$distinct_sections" -lt 3 ]; then
-    report live-status "live requires at least 3 distinct stamped sections; found $distinct_sections"
+heading_set_matches=1
+for required_heading in "${required_headings[@]}"; do
+  occurrences=$(printf '%s' "$found_list" | grep -Fxc "$required_heading")
+  if [ "$occurrences" -eq 0 ]; then
+    report required-heading "missing ## $required_heading"
+    heading_set_matches=0
+  elif [ "$occurrences" -gt 1 ]; then
+    report duplicate-heading "## $required_heading appears $occurrences times"
+    heading_set_matches=0
+  fi
+done
+
+while IFS= read -r found_heading; do
+  [ -n "$found_heading" ] || continue
+  if ! printf '%s\n' "${required_headings[@]}" | grep -Fqx "$found_heading"; then
+    report unexpected-heading "## $found_heading is not one of the ${#required_headings[@]} fixed sections"
+    heading_set_matches=0
+  fi
+done <<< "$found_list"
+
+if [ "$heading_set_matches" -eq 1 ]; then
+  found_order=$(printf '%s' "$found_list" | paste -sd ',' - | sed 's/,/, /g')
+  if [ "$found_order" != "$expected_order" ]; then
+    report heading-order "sections run $found_order, expected $expected_order"
   fi
 fi
 
+# The header stamp is the one clock the file contract requires.
 last_updated_stamp=
 last_updated_re='^\*\*Last updated:[[:space:]]*(([01][0-9]|2[0-3]):[0-5][0-9])[[:space:]]+\+07\*\*'
 while IFS= read -r line || [ -n "$line" ]; do
@@ -139,11 +147,6 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$BRIEFING"
 if [ -z "$last_updated_stamp" ]; then
   report last-updated 'header is missing a valid Last updated: HH:MM +07 stamp'
-elif [ -n "$last_section_minutes" ]; then
-  last_updated_minutes=$(clock_minutes "$last_updated_stamp")
-  if [ "$last_updated_minutes" -lt "$last_section_minutes" ]; then
-    report last-updated "$last_updated_stamp is earlier than last section $last_section_stamp"
-  fi
 fi
 
 # A clock may use parenthetical punctuation, but every individual HH:MM token
@@ -172,18 +175,6 @@ while IFS= read -r line || [ -n "$line" ]; do
     report credentials "credential-shaped string at line $line_number"
   fi
 done < "$BRIEFING"
-
-for required_heading in \
-  'Open for the captain' \
-  'Shipped today' \
-  'Broke / went wrong' \
-  'Still open' \
-  'Log' \
-  'Reference'; do
-  if ! grep -Fqx "## $required_heading" "$BRIEFING"; then
-    report required-heading "missing ## $required_heading"
-  fi
-done
 
 pr_numbers=$(grep -Eo '#[0-9]+' "$BRIEFING" 2>/dev/null | tr -d '#' | LC_ALL=C sort -nu || true)
 while IFS= read -r pr_number; do

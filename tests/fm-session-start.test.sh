@@ -1006,31 +1006,28 @@ write_session_briefing() {
   file="$mount/Daily Briefings/$briefing_date.md"
   cat > "$file" <<EOF
 # Daily Briefing — $weekday $briefing_date
-**Status: live**
-**Last updated: 10:00 +07** — rewritten on every append.
 
-## Open for the captain
-Nothing pending.
+**Last updated: 10:00 +07**
 
-## Shipped today
-Nothing shipped.
+## Fleet state
 
-## Broke / went wrong
-Nothing broke.
+- none
 
-## Still open
-Nothing open.
+## Open
 
-## Log
-## 08:00 +07 — Started
-Work began.
-## 08:30 +07 — Continued
-Work continued.
-## 09:00 +07 — Finished
-Work finished.
+- none
+
+## Shipped
+
+- none
+
+## Broke
+
+- none
 
 ## Reference
-No references.
+
+- none
 EOF
   stamp=${briefing_date//-/}
   touch -t "${stamp}1200" "$file"

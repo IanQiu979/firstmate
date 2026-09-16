@@ -14,31 +14,34 @@ write_clean_briefing() {
   file="$dir/2026-08-24.md"
   cat > "$file" <<'EOF'
 # Daily Briefing — Monday 2026-08-24
-**Status: live**
-**Last updated: 10:00 +07** — rewritten on every append.
 
-## Open for the captain
-Nothing pending.
+**Last updated: 10:00 +07**
 
-## Shipped today
-Nothing shipped.
+## Fleet state
 
-## Broke / went wrong
-Nothing broke.
-
-## Still open
-Nothing open.
-
-## Log
-## 08:00 +07 — Started
 Work began at 07:30 +07.
-## 08:30 +07 — Continued
-Work continued.
-## 09:00 +07 — Finished
-Work finished.
+
+- none
+
+## Open
+
+- none
+
+## Shipped
+
+- none
+
+## Broke
+
+- none
 
 ## Reference
-No references.
+
+- none
+
+### Log
+
+- 09:00 +07 nothing to report.
 EOF
   touch -t 202608241200 "$file"
   printf '%s\n' "$file"
@@ -86,48 +89,6 @@ test_wrong_weekday_is_rejected() {
   pass "fm-briefing-lint: rejects a weekday that does not match the date"
 }
 
-test_out_of_order_section_timestamps_are_rejected() {
-  local file output
-  file=$(write_clean_briefing "$TMP_ROOT/out-of-order")
-  sed -i.bak 's/## 09:00 +07 — Finished/## 08:15 +07 — Finished/' "$file"
-  rm "$file.bak"
-  set_fixture_mtime "$file"
-  output="$TMP_ROOT/out-of-order.out"
-  run_linter "$file" "$output"
-  [ "$RUN_STATUS" -eq 1 ] || fail "out-of-order stamps exited $RUN_STATUS instead of 1"
-  assert_only_finding "$output" section-order
-  pass "fm-briefing-lint: rejects non-ascending stamped sections"
-}
-
-test_live_status_requires_three_distinct_stamped_sections() {
-  local file output
-  file=$(write_clean_briefing "$TMP_ROOT/false-live")
-  sed -i.bak \
-    -e '/^## 08:30 +07 /,+1d' \
-    -e '/^## 09:00 +07 /,+1d' \
-    "$file"
-  rm "$file.bak"
-  set_fixture_mtime "$file"
-  output="$TMP_ROOT/false-live.out"
-  run_linter "$file" "$output"
-  [ "$RUN_STATUS" -eq 1 ] || fail "false live status exited $RUN_STATUS instead of 1"
-  assert_only_finding "$output" live-status
-  pass "fm-briefing-lint: rejects live status with only one stamped section"
-}
-
-test_last_updated_cannot_precede_last_section() {
-  local file output
-  file=$(write_clean_briefing "$TMP_ROOT/stale-header")
-  sed -i.bak 's/Last updated: 10:00 +07/Last updated: 08:45 +07/' "$file"
-  rm "$file.bak"
-  set_fixture_mtime "$file"
-  output="$TMP_ROOT/stale-header.out"
-  run_linter "$file" "$output"
-  [ "$RUN_STATUS" -eq 1 ] || fail "stale header exited $RUN_STATUS instead of 1"
-  assert_only_finding "$output" last-updated
-  pass "fm-briefing-lint: rejects a last-updated stamp before the last section"
-}
-
 test_every_clock_time_requires_the_offset() {
   local file output
   file=$(write_clean_briefing "$TMP_ROOT/missing-offset")
@@ -163,17 +124,89 @@ EOF
   pass "fm-briefing-lint: rejects every prohibited credential shape"
 }
 
-test_all_six_required_headings_are_required() {
+test_missing_last_updated_stamp_is_rejected() {
   local file output
-  file=$(write_clean_briefing "$TMP_ROOT/missing-heading")
-  sed -i.bak 's/^## Reference$/## Notes/' "$file"
+  file=$(write_clean_briefing "$TMP_ROOT/missing-last-updated")
+  sed -i.bak 's/^\*\*Last updated: 10:00 +07\*\*$/**Last updated: today**/' "$file"
   rm "$file.bak"
   set_fixture_mtime "$file"
-  output="$TMP_ROOT/missing-heading.out"
+  output="$TMP_ROOT/missing-last-updated.out"
   run_linter "$file" "$output"
-  [ "$RUN_STATUS" -eq 1 ] || fail "missing required heading exited $RUN_STATUS instead of 1"
-  assert_only_finding "$output" required-heading
-  pass "fm-briefing-lint: rejects a missing required heading"
+  [ "$RUN_STATUS" -eq 1 ] || fail "missing last-updated stamp exited $RUN_STATUS instead of 1"
+  assert_only_finding "$output" last-updated
+  pass "fm-briefing-lint: rejects a header without a Last updated: HH:MM +07 stamp"
+}
+
+test_every_template_heading_is_required() {
+  local file output heading
+  for heading in 'Fleet state' 'Open' 'Shipped' 'Broke' 'Reference'; do
+    file=$(write_clean_briefing "$TMP_ROOT/missing-${heading// /-}")
+    sed -i.bak "/^## ${heading}\$/d" "$file"
+    rm "$file.bak"
+    set_fixture_mtime "$file"
+    output="$TMP_ROOT/missing-${heading// /-}.out"
+    run_linter "$file" "$output"
+    [ "$RUN_STATUS" -eq 1 ] || fail "missing ## $heading exited $RUN_STATUS instead of 1"
+    assert_only_finding "$output" required-heading
+    grep -Fq "missing ## $heading" "$output" \
+      || fail "missing ## $heading was not named in the finding: $(cat "$output")"
+  done
+  pass "fm-briefing-lint: rejects a briefing missing any of the five template headings"
+}
+
+test_unexpected_h2_heading_is_rejected() {
+  local file output
+  file=$(write_clean_briefing "$TMP_ROOT/unexpected-heading")
+  printf '\n## Notes\n\n- none\n' >> "$file"
+  set_fixture_mtime "$file"
+  output="$TMP_ROOT/unexpected-heading.out"
+  run_linter "$file" "$output"
+  [ "$RUN_STATUS" -eq 1 ] || fail "unexpected heading exited $RUN_STATUS instead of 1"
+  assert_only_finding "$output" unexpected-heading
+  grep -Fq '## Notes is not one of the 5 fixed sections' "$output" \
+    || fail "unexpected heading finding did not name the five-section contract: $(cat "$output")"
+  pass "fm-briefing-lint: rejects an h2 heading outside the template"
+}
+
+test_h3_subsections_are_not_flagged() {
+  local file output
+  file=$(write_clean_briefing "$TMP_ROOT/h3-subsections")
+  printf '\n### HANDOFF\n\n- read this first.\n\n#### Deeper\n\n- none\n' >> "$file"
+  set_fixture_mtime "$file"
+  output="$TMP_ROOT/h3-subsections.out"
+  run_linter "$file" "$output"
+  [ "$RUN_STATUS" -eq 0 ] || fail "h3 subsections exited $RUN_STATUS: $(cat "$output")"
+  [ "$(cat "$output")" = OK ] || fail "h3 subsection fixture did not print OK"
+  pass "fm-briefing-lint: leaves h3 and deeper subsections free-form"
+}
+
+test_duplicate_template_heading_is_rejected() {
+  local file output
+  file=$(write_clean_briefing "$TMP_ROOT/duplicate-heading")
+  printf '\n## Open\n\n- none\n' >> "$file"
+  set_fixture_mtime "$file"
+  output="$TMP_ROOT/duplicate-heading.out"
+  run_linter "$file" "$output"
+  [ "$RUN_STATUS" -eq 1 ] || fail "duplicate heading exited $RUN_STATUS instead of 1"
+  assert_only_finding "$output" duplicate-heading
+  pass "fm-briefing-lint: rejects a template heading that appears twice"
+}
+
+test_template_headings_must_keep_their_order() {
+  local file output
+  file=$(write_clean_briefing "$TMP_ROOT/heading-order")
+  awk '
+    /^## Shipped$/ { print "## Broke"; next }
+    /^## Broke$/ { print "## Shipped"; next }
+    { print }
+  ' "$file" > "$file.swapped"
+  mv "$file.swapped" "$file"
+  set_fixture_mtime "$file"
+  output="$TMP_ROOT/heading-order.out"
+  run_linter "$file" "$output"
+  [ "$RUN_STATUS" -eq 1 ] || fail "swapped headings exited $RUN_STATUS instead of 1"
+  assert_only_finding "$output" heading-order
+  pass "fm-briefing-lint: rejects template headings out of order"
 }
 
 test_bare_pr_reference_requires_matching_https_url() {
@@ -226,8 +259,7 @@ test_mtime_date_must_match_filename_without_sealed_marker() {
 test_sealed_marker_allows_later_mtime() {
   local file output
   file=$(write_clean_briefing "$TMP_ROOT/sealed-mtime")
-  sed -i.bak 's/\*\*Status: live\*\*/**Status: sealed 04:05 +07**\nSEALED 04:05 +07 2026-08-25/' "$file"
-  rm "$file.bak"
+  printf '\nSEALED 04:05 +07 2026-08-25\n' >> "$file"
   touch -t 202608251200 "$file"
   output="$TMP_ROOT/sealed-mtime.out"
   run_linter "$file" "$output"
@@ -238,12 +270,14 @@ test_sealed_marker_allows_later_mtime() {
 
 test_clean_file_is_accepted
 test_wrong_weekday_is_rejected
-test_out_of_order_section_timestamps_are_rejected
-test_live_status_requires_three_distinct_stamped_sections
-test_last_updated_cannot_precede_last_section
 test_every_clock_time_requires_the_offset
 test_credential_patterns_are_rejected
-test_all_six_required_headings_are_required
+test_missing_last_updated_stamp_is_rejected
+test_every_template_heading_is_required
+test_unexpected_h2_heading_is_rejected
+test_h3_subsections_are_not_flagged
+test_duplicate_template_heading_is_rejected
+test_template_headings_must_keep_their_order
 test_bare_pr_reference_requires_matching_https_url
 test_pr_reference_with_matching_https_url_is_accepted
 test_exactly_one_h1_is_required
