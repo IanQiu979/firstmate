@@ -1,0 +1,92 @@
+$ ls "/Volumes/IanUSB/3 - Daily/Daily Briefings"
+2026-08-23.md
+2026-08-24.md
+2026-08-25.md
+2026-08-26.md
+2026-08-28.md
+2026-08-29.md
+2026-08-30.md
+2026-09-01.md
+2026-09-02.md
+2026-09-03.md
+2026-09-04.md
+2026-09-05.md
+2026-09-06.md
+2026-09-07.md
+2026-09-09.md
+2026-09-10.md
+2026-09-12.md
+2026-09-13.md
+2026-09-14.md
+2026-09-15.md
+2026-09-16.md
+README.md
+TEMPLATE.md
+
+### /bin/bash (3.2.57(1)-release)
+$ fm-briefing-lint.sh 2026-09-10.md
+OK
+exit=0
+$ fm-briefing-lint.sh 2026-09-12.md
+OK
+exit=0
+$ fm-briefing-lint.sh 2026-09-13.md
+OK
+exit=0
+$ fm-briefing-lint.sh 2026-09-14.md
+OK
+exit=0
+$ fm-briefing-lint.sh 2026-09-15.md
+OK
+exit=0
+$ fm-briefing-lint.sh 2026-09-16.md
+OK
+exit=0
+### bash (5.3.15(1)-release)
+$ fm-briefing-lint.sh 2026-09-10.md
+OK
+exit=0
+$ fm-briefing-lint.sh 2026-09-12.md
+OK
+exit=0
+$ fm-briefing-lint.sh 2026-09-13.md
+OK
+exit=0
+$ fm-briefing-lint.sh 2026-09-14.md
+OK
+exit=0
+$ fm-briefing-lint.sh 2026-09-15.md
+OK
+exit=0
+$ fm-briefing-lint.sh 2026-09-16.md
+OK
+exit=0
+
+### Old-contract briefing (pre-2026-09-10 format) must now fail on the template checks
+$ /bin/bash bin/fm-briefing-lint.sh old-contract/2026-08-24.md
+required-heading: missing ## Fleet state
+required-heading: missing ## Open
+required-heading: missing ## Shipped
+required-heading: missing ## Broke
+unexpected-heading: ## Open for the captain is not one of the 5 fixed sections
+unexpected-heading: ## Shipped today is not one of the 5 fixed sections
+unexpected-heading: ## Broke / went wrong is not one of the 5 fixed sections
+unexpected-heading: ## Still open is not one of the 5 fixed sections
+unexpected-heading: ## Log is not one of the 5 fixed sections
+unexpected-heading: ## 08:00 +07 — Started is not one of the 5 fixed sections
+exit=1
+
+### File with no h2 headings at all under bash 3.2 (the set -u empty-array crash case)
+$ /bin/bash bin/fm-briefing-lint.sh noh2/2026-08-24.md
+required-heading: missing ## Fleet state
+required-heading: missing ## Open
+required-heading: missing ## Shipped
+required-heading: missing ## Broke
+required-heading: missing ## Reference
+exit=1
+
+### One renamed heading (Shipped -> Shipped today) yields exactly one finding, no cascading order finding
+$ /bin/bash bin/fm-briefing-lint.sh rename/2026-08-24.md
+required-heading: missing ## Shipped
+unexpected-heading: ## Shipped today is not one of the 5 fixed sections
+exit=1
