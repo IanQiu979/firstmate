@@ -11,7 +11,8 @@
 #   - output section ordering: the safety preamble leads unchanged, live fleet
 #     state precedes the curated memory a truncated tail may take, and the
 #     read-once contract precedes both
-#   - optional daily-briefing lint: absent media and clean files stay silent,
+#   - optional daily-briefing lint: absent media and clean files stay silent, the
+#     reshuffled "3 - Daily/Daily Briefings" folder wins over the legacy root one,
 #     while violations in today's and yesterday's files are labeled without
 #     gating session start
 #   - context-aware next-step guidance for read-only, AFK, X mode, and normal
@@ -1078,7 +1079,21 @@ EOF
   assert_contains "$out" "BRIEFING_LINT: $yesterday: weekday:" \
     "yesterday's daily-briefing violation was not labeled in the digest"
 
-  pass "session start silently skips absent or clean briefings and labels informational findings for today and yesterday"
+  # The 2026-09-16 USB reshuffle moved the folder under "3 - Daily"; that layout
+  # must win over a stale legacy root folder so a clean current briefing is not
+  # judged by an old copy.
+  mount="$TMP_ROOT/briefing-volume-reshuffled"
+  write_session_briefing "$mount" "$today" Wrongday
+  write_session_briefing "$mount/3 - Daily" "$today" "$today_weekday"
+  write_session_briefing "$mount/3 - Daily" "$yesterday" "$yesterday_weekday"
+  status=0
+  out=$(FM_SESSION_START_BRIEFING_MOUNT="$mount" \
+    run_session_start "$home" "$root" "$fakebin:$BASE_PATH") || status=$?
+  expect_code 0 "$status" "reshuffled daily-briefing lint session start"
+  assert_not_contains "$out" "BRIEFING_LINT:" \
+    "the reshuffled '3 - Daily' layout did not take precedence over the legacy root folder"
+
+  pass "session start silently skips absent or clean briefings, labels informational findings for today and yesterday, and prefers the reshuffled briefing folder"
 }
 
 # The contract has to survive tail truncation and stay honest once it precedes
