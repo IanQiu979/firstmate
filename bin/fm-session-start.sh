@@ -404,7 +404,19 @@ print_daily_briefing_lint() {
   mount=${FM_SESSION_START_BRIEFING_MOUNT:-/Volumes/IanUSB}
   [ -d "$mount" ] || return 0
 
-  briefing_dir="$mount/Daily Briefings"
+  # The captain's USB layout changed on 2026-09-16 (numbering replaced by an
+  # importance order). Resolve the first directory that exists so a further
+  # reshuffle degrades to the existing silent no-op rather than a hard break.
+  briefing_dir=
+  for candidate in \
+    "$mount/3 - Daily/Daily Briefings" \
+    "$mount/00 - Operating System/Daily Briefings" \
+    "$mount/Daily Briefings"; do
+    [ -d "$candidate" ] || continue
+    briefing_dir=$candidate
+    break
+  done
+  [ -n "$briefing_dir" ] || return 0
   today=$(date '+%Y-%m-%d' 2>/dev/null) || return 0
   yesterday=$(daily_briefing_yesterday 2>/dev/null) || yesterday=
 
