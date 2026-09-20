@@ -1,0 +1,40 @@
+## 1. Reshuffled layout only: violating briefing under '3 - Daily/Daily Briefings' -> lint fires again (was silently disabled before the fix)
+  tree: ./3 - Daily/Daily Briefings/2026-09-19.md
+  tree: ./3 - Daily/Daily Briefings/2026-09-20.md
+  exit=0
+  BRIEFING_LINT: 2026-09-20: weekday: 2026-09-20 is Sunday, not Wrongday
+  BRIEFING_LINT: 2026-09-19: weekday: 2026-09-19 is Saturday, not Wrongday
+## 2. Reshuffled + stale legacy root copy: clean '3 - Daily' wins, stale root 'Wrongday' is ignored
+  tree: ./3 - Daily/Daily Briefings/2026-09-19.md
+  tree: ./3 - Daily/Daily Briefings/2026-09-20.md
+  tree: ./Daily Briefings/2026-09-20.md
+  exit=0
+  (no BRIEFING_LINT lines)
+## 3. Legacy '00 - Operating System' layout only: second candidate is used
+  tree: ./00 - Operating System/Daily Briefings/2026-09-20.md
+  exit=0
+  BRIEFING_LINT: 2026-09-20: weekday: 2026-09-20 is Sunday, not Wrongday
+## 4. Original root layout only: last fallback still linted
+  tree: ./Daily Briefings/2026-09-20.md
+  exit=0
+  BRIEFING_LINT: 2026-09-20: weekday: 2026-09-20 is Sunday, not Wrongday
+## 5. Future reshuffle to an unknown folder: silent no-op, session start still exits 0
+  tree: ./9 - Somewhere Else/Daily Briefings/2026-09-20.md
+  exit=0
+  (no BRIEFING_LINT lines)
+## 6. Real default mount /Volumes/IanUSB present on this machine?
+  1 - Discipline System
+  10 - Inbox
+  2 - Money
+  3 - Daily
+  4 - Projects
+  5 - Reference & Knowledge
+  6 - Content & Media
+  7 - Personal
+  8 - Local AI Models
+  9 - Archive & Backups
+  README.md
+## 7. Real device: does the first candidate resolve on /Volumes/IanUSB (read-only check)?
+  EXISTS: /Volumes/IanUSB/3 - Daily/Daily Briefings (26 briefing files, latest: TEMPLATE.md)
+  absent: /Volumes/IanUSB/00 - Operating System/Daily Briefings
+  absent: /Volumes/IanUSB/Daily Briefings

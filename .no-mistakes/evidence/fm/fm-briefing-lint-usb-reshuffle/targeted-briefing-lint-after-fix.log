@@ -1,0 +1,2 @@
+ok - session start silently skips absent or clean briefings, labels informational findings for today and yesterday, and prefers the reshuffled briefing folder
+# targeted: briefing lint test passed
